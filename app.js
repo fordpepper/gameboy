@@ -3,6 +3,7 @@
 const $ = id => document.getElementById(id);
 const canvas = $('lcd'), ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const root = document.documentElement;
+const APP_VERSION = '11';   // bump together with index.html (?v=) and sw.js; both players must match
 const IS_IPAD = /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 /* ---------------------------------------------------------- settings */
@@ -465,7 +466,7 @@ window.addEventListener('orientationchange', () => { relayout(); setTimeout(layo
    lower input delay (fewer, bigger batches vs. one message per frame). */
 const MAXP = 8, GHOST_MS = 110, GHOST_STALE = 3000, CADENCE = 6;
 const mp = { role: null, pid: 0, stage: 'idle', code: '', sub: null, peers: new Map(), pending: new Map(), nextPid: 1, guestPeer: null, guestId: '', pendingRom: null,
-  lobby: [], mode: 'race', prio: 'data', active: false, players: [], D: 6, B: 4, flushMs: 0, frame: 0, queued: 0, sentUpTo: 0, runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {},
+  lobby: [], seen: new Set(), mode: 'race', prio: 'data', active: false, players: [], D: 6, B: 4, flushMs: 0, frame: 0, queued: 0, sentUpTo: 0, runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {},
   outbox: [], flushT: 0, posT: 0, stall: 0, waiting: false, mine: {}, remote: {}, checks: 0, desync: false, manual: '',
   ghosts: new Map(), lastPos: '', lastPose: '', sentTile: [], sendCount: 0, sinceSend: 0, hostPos: new Map() };
 const nameOf = pid => 'P' + (pid + 1);
@@ -537,7 +538,7 @@ function broadcastLobby() { jsonClients({ t: 'lobby', players: mp.lobby, mode: m
 function hostMakePeer(joinId) {
   let pid = -1;
   const peer = new Net.Peer({
-    open() { pid = mp.nextPid++; mp.peers.set(pid, peer); mp.pending.delete(joinId); peer.send({ t: 'hello', pid, rom: romHash, name: romName }); },
+    open() { pid = mp.nextPid++; mp.peers.set(pid, peer); mp.pending.delete(joinId); peer.send({ t: 'hello', pid, rom: romHash, name: romName, ver: APP_VERSION }); },
     msg(m) {
       if (m.t === 'ready') { if (!mp.lobby.includes(pid)) mp.lobby.push(pid); broadcastLobby(); }
       else if (m.t === 'err') { toast(`${nameOf(pid)}: ${m.msg}`); peer.close(); }
@@ -546,6 +547,7 @@ function hostMakePeer(joinId) {
       else if (m.t === 'bye') hostDrop(pid);
     },
     bin(u) { hostBin(pid, u); },
+    state(s) { if (s === 'failed') { toast('A player couldn’t connect directly (their network may block it). Try manual codes or another network.'); mp.pending.delete(joinId); } },
     close() { hostDrop(pid); mp.pending.delete(joinId); },
   });
   return peer;
@@ -560,20 +562,23 @@ function hostDrop(pid) {
     if (!mp.peers.size) mpEnd('Everyone else left');
   } else broadcastLobby();
 }
+function relayError(code) {
+  mpStatus(code === 429 ? 'The free code service is rate-limited right now (it allows 60 requests per 5 minutes per network). Wait a few minutes, or use manual codes.'
+    : code === -1 ? 'Gave up reaching the code service. Check your connection, or use manual codes.' : code ? `Code service error (${code}). Retrying…` : 'Can’t reach the code service. Retrying…');
+}
 async function hostOpenLobby() {
   if (!gb) { toast('Load a game first'); return; }
-  mp.role = 'host'; mp.pid = 0; mp.stage = 'lobby'; mp.lobby = [0]; mp.manual = ''; mp.code = Net.newCode();
+  mp.role = 'host'; mp.pid = 0; mp.stage = 'lobby'; mp.lobby = [0]; mp.seen = new Set(); mp.manual = ''; mp.code = Net.newCode();
   $('mpCode').textContent = fmtCode(mp.code); mpStatus('Opening lobby…'); mpUi();
   try {
     mp.sub = Net.subscribe(mp.code, async msg => {
       const k = msg[0], id = msg.slice(1, 5), rest = msg.slice(5);
       if (k === 'j') {
-        if (mp.pending.has(id) || mp.peers.size + mp.pending.size >= MAXP - 1 || mp.active) return;
-        const peer = hostMakePeer(id); mp.pending.set(id, peer);
+        if (mp.seen.has(id) || mp.peers.size + mp.pending.size >= MAXP - 1 || mp.active) return;
+        mp.seen.add(id); const peer = hostMakePeer(id); mp.pending.set(id, peer);
         try { await Net.publish(mp.code, 'o' + id + await peer.host()); } catch (e) { mpStatus('Code service error: ' + e.message); }
       } else if (k === 'a') { const peer = mp.pending.get(id); if (peer) peer.accept(rest).catch(() => {}); }
-    }, () => mpStatus('Reconnecting to the code service…'));
-    await Net.publish(mp.code, 'x' + mp.code);  // makes sure the topic is reachable; also fails fast if the service is down
+    }, relayError);
     mpStatus('Lobby open. Friends enter the code to join (up to 7).');
   } catch (e) { mpEnd('Couldn’t reach the code service (' + e.message + '). Try “manual codes” below.'); }
 }
@@ -585,6 +590,7 @@ function guestHandlers() {
       switch (m.t) {
         case 'hello': {
           mp.pid = m.pid;
+          if (m.ver !== APP_VERSION) { mp.guestPeer.send({ t: 'err', msg: `has app version ${APP_VERSION} but the host has ${m.ver}` }); mpEnd(`Your app version (${APP_VERSION}) differs from the host’s (${m.ver}). Close and reopen the app on both devices, then try again.`); return; }
           const r = await mpFindRom(m.rom);
           if (!r) { mp.guestPeer.send({ t: 'err', msg: `needs “${m.name}” (same ROM file)` }); mpEnd(`You don’t have “${m.name}”. Add the same ROM file first.`); return; }
           mp.pendingRom = r; mp.guestPeer.send({ t: 'ready' }); mp.stage = 'lobby'; mpStatus('Joined. Waiting for the host to start…'); mpUi(); break;
@@ -598,19 +604,19 @@ function guestHandlers() {
       }
     },
     bin: u => guestBin(u),
-    close: () => { if (mp.guestPeer) mpEnd('Connection lost'); },
+    close: () => { if (mp.guestPeer) mpEnd(mp.stage === 'active' ? 'Connection lost' : 'Couldn’t connect directly (a network may be blocking it). Try manual codes or another network.'); },
     state: s => { if (!mp.active && s === 'connecting') mpStatus('Connecting…'); },
   };
 }
 async function guestJoin(code) {
   mp.role = 'guest'; mp.stage = 'join'; mp.guestPeer = new Net.Peer(guestHandlers()); mp.guestId = Net.newCode().slice(0, 4);
   mpStatus('Looking for the host…'); mpUi(); let got = false;
-  const timer = setTimeout(() => { if (!got) { mpEnd('No game found for that code. Check the code and that the host has the lobby open.'); } }, 20000);
+  const timer = setTimeout(() => { if (!got) { mpEnd('No game found for that code. Check the code, that the host has the lobby open, and that you both run the same app version (' + APP_VERSION + ').'); } }, 20000);
   mp.sub = Net.subscribe(code, async msg => {
     if (msg[0] !== 'o' || msg.slice(1, 5) !== mp.guestId || got) return; got = true; clearTimeout(timer);
     try { mpStatus('Connecting…'); const ans = await mp.guestPeer.join(msg.slice(5)); await Net.publish(code, 'a' + mp.guestId + ans); }
     catch (e) { mpEnd('Couldn’t connect: ' + e.message); }
-  }, () => mpStatus('Can’t reach the code service. Try “manual codes”.'));
+  }, relayError);
   try { await Net.publish(code, 'j' + mp.guestId); } catch (e) { clearTimeout(timer); mpEnd('Couldn’t reach the code service (' + e.message + ')'); }
 }
 async function mpFindRom(hash) {
@@ -868,7 +874,7 @@ function openMenu() {
   if (mp.active && lockstep()) flushLocal();   // let the others run ahead on the inputs we already have
   audioSleep(mp.active ? 60000 : 4000);
 }
-function closeMenu() { $('menu').classList.remove('open'); paused = false; if (gb) gb.apu.flush(); audioWake(); kick(); }
+function closeMenu() { if (updateReady && !mp.active) { location.reload(); return; } $('menu').classList.remove('open'); paused = false; if (gb) gb.apu.flush(); audioWake(); kick(); }
 $('menuBtn').addEventListener('click', openMenu);
 $('closeMenu').addEventListener('click', closeMenu);
 $('menu').addEventListener('click', e => { if (e.target.id === 'menu' && gb) closeMenu(); });
@@ -922,8 +928,21 @@ $('lcdbox').classList.toggle('plain', !lcdFx); $('fps').style.display = showFps 
 $('resetBtn').onclick = () => { if (gb) { flushSave(); const rn = romName; romGet(rn).then(r => r && startRom(rn, r.data)); } };
 
 // Offline support (HTTPS / localhost only).
-if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
+let updateReady = false;
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    reg.update().catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+  }).catch(() => {});
+  // A new version took over: reload when it's safe (nothing running), otherwise on the next time the menu opens.
+  let hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController) { hadController = true; return; }
+    updateReady = true; if (!mp.active && (paused || !gb)) location.reload(); else toast('A new version is ready. Open the menu and tap Done to update.');
+  });
+}
 
+$('ver').textContent = 'Version ' + APP_VERSION;
 mpUi(); layout();
 window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask, ghosts: mp.ghosts });
 

@@ -82,11 +82,36 @@ async function publish(code, text) {
   if (!r.ok) throw new Error('relay ' + r.status);
 }
 // Calls cb(text) for every message on the topic (including ones sent before we joined). Returns a close function.
+// Streams the relay's JSON feed with fetch so we see HTTP errors (e.g. 429 rate limit), and reconnects with
+// backoff (resuming after the last message) instead of the browser's endless instant retries.
+// onError(code): HTTP status, 0 = network error, -1 = gave up.
 function subscribe(code, cb, onError) {
-  const es = new EventSource(RELAY + topic(code) + '/sse?since=all');
-  es.onmessage = e => { try { const m = JSON.parse(e.data); if (m.event === 'message' && typeof m.message === 'string') cb(m.message); } catch {} };
-  es.onerror = () => { if (onError) onError(); };
-  return () => es.close();
+  const ac = new AbortController(); let stopped = false, tries = 0, last = 'all';
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const run = async () => {
+    while (!stopped) {
+      try {
+        const r = await fetch(RELAY + topic(code) + '/json?since=' + last, { signal: ac.signal });
+        if (!r.ok) { if (onError) onError(r.status); tries += r.status === 429 ? 3 : 1; }
+        else {
+          tries = 0; const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+          for (;;) {
+            const { value, done } = await reader.read(); if (done) break;
+            buf += dec.decode(value, { stream: true }); let i;
+            while ((i = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!line) continue;
+              try { const m = JSON.parse(line); if (m.id) last = m.id; if (m.event === 'message' && typeof m.message === 'string') cb(m.message); } catch {}
+            }
+          }
+        }
+      } catch (e) { if (stopped) return; if (onError) onError(0); tries++; }
+      if (stopped) return;
+      if (tries > 6) { if (onError) onError(-1); return; }
+      await sleep(Math.min(30000, 1500 * 2 ** Math.max(0, tries)));
+    }
+  };
+  run();
+  return () => { stopped = true; try { ac.abort(); } catch {} };
 }
 
 const fnv = (arr, step = 1) => { let h = 0x811C9DC5; for (let i = 0; i < arr.length; i += step) { h ^= arr[i]; h = Math.imul(h, 0x01000193); } return h >>> 0; };
