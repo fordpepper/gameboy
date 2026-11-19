@@ -3,7 +3,7 @@
 const $ = id => document.getElementById(id);
 const canvas = $('lcd'), ctx = canvas.getContext('2d', { alpha: false });
 const root = document.documentElement;
-const APP_VERSION = '12';   // bump together with index.html (?v=) and sw.js; both players must match
+const APP_VERSION = '13';   // bump together with index.html (?v=) and sw.js; both players must match
 const IS_IPAD = /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 /* ---------------------------------------------------------- settings */
@@ -422,6 +422,7 @@ function frame(ts) {
   if (work > PERF.workMax) PERF.workMax = work; if (dt > 1.5 * 1000 / dispHz) PERF.late++;
   if (fpsT >= 1000) {
     if (showFps) $('fps').textContent = `${(produced * 1000 / fpsT).toFixed(1)} fps · display ${(frames * 1000 / fpsT).toFixed(1)} Hz · in: ${maskText(lastMask)}` +
+      (mp.active && lockstep() ? ` · lead ${mp.lead} · stalls ${mp.stalls}` : '') +
       ` · work ${(PERF.work.reduce((s, x) => s + x, 0) / Math.min(600, PERF.ticks)).toFixed(1)}/${PERF.workMax.toFixed(1)} ms · late ${PERF.late}` +
       (audio ? ` · audio ${audio.ctx.state}${gb ? ' buf ' + gb.apu.fill() : ''}` : ' · audio off');
     fpsT = 0; frames = 0; produced = 0; updateSnd();
@@ -482,8 +483,16 @@ window.addEventListener('orientationchange', () => { relayout(); setTimeout(layo
    Data per player is tiny by design (a few hundred bytes/s). The "Low delay" option trades some of that for
    lower input delay (fewer, bigger batches vs. one message per frame). */
 const MAXP = 8, GHOST_MS = 110, GHOST_STALE = 3000, CADENCE = 6;
+// Speed presets for co-op (the game waits for everyone's input, so connection hiccups show up as speed changes):
+//  margin = extra frames of safety on top of the measured connection; B = frames per message (1 = every frame, more data);
+//  step = frames added when someone stalls; max = cap; lower = ms of calm before trimming back toward the base delay (0 = never).
+const SPEEDS = {
+  steady:   { margin: 4, B: 4, step: 3, max: 30, lower: 0,     label: 'Steady' },
+  balanced: { margin: 2, B: 4, step: 2, max: 24, lower: 12000, label: 'Balanced' },
+  quick:    { margin: 0, B: 1, step: 1, max: 16, lower: 6000,  label: 'Quick' },
+};
 const mp = { role: null, pid: 0, stage: 'idle', code: '', sub: null, peers: new Map(), pending: new Map(), nextPid: 1, guestPeer: null, guestId: '', pendingRom: null,
-  lobby: [], seen: new Set(), mode: 'race', prio: 'data', active: false, players: [], D: 6, B: 4, flushMs: 0, frame: 0, queued: 0, sentUpTo: 0, runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {},
+  lobby: [], seen: new Set(), mode: 'race', speed: 'balanced', active: false, players: [], D: 6, B: 4, flushMs: 0, lead: 6, baseLead: 6, maxLead: 24, step: 2, lowerMs: 12000, lastRaise: 0, lastLower: 0, lastMore: 0, stalls: 0, frame: 0, queued: 0, sentUpTo: 0, runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {},
   outbox: [], flushT: 0, posT: 0, stall: 0, waiting: false, mine: {}, remote: {}, checks: 0, desync: false, manual: '',
   ghosts: new Map(), lastPos: '', lastPose: '', sentTile: [], sendCount: 0, sinceSend: 0, hostPos: new Map() };
 const nameOf = pid => 'P' + (pid + 1);
@@ -551,7 +560,7 @@ function mpEnd(msg) {
 }
 
 /* ---- host: lobby & peers ---- */
-function broadcastLobby() { jsonClients({ t: 'lobby', players: mp.lobby, mode: mp.mode, prio: mp.prio }); mpUi(); mpStatus(`${mp.lobby.length} player${mp.lobby.length > 1 ? 's' : ''} in the lobby`); }
+function broadcastLobby() { jsonClients({ t: 'lobby', players: mp.lobby, mode: mp.mode, speed: mp.speed }); mpUi(); mpStatus(`${mp.lobby.length} player${mp.lobby.length > 1 ? 's' : ''} in the lobby`); }
 function hostMakePeer(joinId) {
   let pid = -1;
   const peer = new Net.Peer({
@@ -561,6 +570,7 @@ function hostMakePeer(joinId) {
       else if (m.t === 'err') { toast(`${nameOf(pid)}: ${m.msg}`); peer.close(); }
       else if (m.t === 'pong') { if (peer._pr) peer._pr(performance.now() - m.ts); }
       else if (m.t === 'ds') toast(`${nameOf(pid)} reports the games went out of sync`);
+      else if (m.t === 'more') { for (const p of (m.pids || [])) { if (p === 0) raiseLead(); else { const pr = mp.peers.get(p); if (pr) pr.send({ t: 'more' }); } } }
       else if (m.t === 'bye') hostDrop(pid);
     },
     bin(u) { hostBin(pid, u); },
@@ -612,10 +622,11 @@ function guestHandlers() {
           if (!r) { mp.guestPeer.send({ t: 'err', msg: `needs “${m.name}” (same ROM file)` }); mpEnd(`You don’t have “${m.name}”. Add the same ROM file first.`); return; }
           mp.pendingRom = r; mp.guestPeer.send({ t: 'ready' }); mp.stage = 'lobby'; mpStatus('Joined. Waiting for the host to start…'); mpUi(); break;
         }
-        case 'lobby': mp.lobby = m.players; mp.mode = m.mode; mp.prio = m.prio; mpStatus(`In lobby (${m.players.length} players). Waiting for the host…`); mpUi(); break;
+        case 'lobby': mp.lobby = m.players; mp.mode = m.mode; mp.speed = m.speed; mpStatus(`In lobby (${m.players.length} players). Waiting for the host…`); mpUi(); break;
         case 'start': mpBegin(m); break;
         case 'ping': mp.guestPeer.send({ t: 'pong', ts: m.ts }); break;
         case 'h': mp.remote[m.f] = m.h; mpCheck(m.f); break;
+        case 'more': if (mp.active && lockstep()) raiseLead(); break;
         case 'drop': mp.dropFrom[m.pid] = m.f; mp.ghosts.delete(m.pid); mp.players = mp.players.filter(p => p !== m.pid || lockstep()); toast(`${nameOf(m.pid)} left`); break;
         case 'bye': mpEnd('The host closed the game'); break;
       }
@@ -645,26 +656,27 @@ async function mpFindRom(hash) {
 /* ---- start / restart (host decides everything, including the input delay) ---- */
 async function pingPeer(peer) {
   const out = [];
-  for (let i = 0; i < 6; i++) out.push(await new Promise(res => { peer._pr = res; peer.send({ t: 'ping', ts: performance.now() }); setTimeout(() => res(NaN), 1500); }));
-  const ok = out.filter(x => x === x).sort((a, b) => a - b); return ok.length ? ok[ok.length >> 1] : 100;
+  for (let i = 0; i < 12; i++) out.push(await new Promise(res => { peer._pr = res; peer.send({ t: 'ping', ts: performance.now() }); setTimeout(() => res(NaN), 1500); }));
+  const ok = out.filter(x => x === x).sort((x, y) => x - y);
+  return ok.length ? ok[Math.min(ok.length - 1, Math.floor(ok.length * 0.9))] : 150;   // 90th percentile: sized for the bad moments, not the average
 }
 async function hostStart() {
   if (mp.lobby.length < 2) return;
-  mp.mode = $('mpMode').value; mp.prio = $('mpPrio').value;
+  mp.mode = $('mpMode').value; mp.speed = $('mpSpeed').value;
   if (mp.mode === 'race' && !ghostSupported()) { toast('Race mode needs Super Mario Land (it draws the other players as ghosts). Pick a co-op mode for other games.'); return; }
   $('mpStart').disabled = true; $('mpRestart').disabled = true; mpStatus('Measuring connections…');
   const rtts = await Promise.all(mp.lobby.filter(p => p !== 0).map(p => pingPeer(mp.peers.get(p))));
-  const n = mp.lobby.length, srt = rtts.slice().sort((a, b) => b - a);
+  const n = mp.lobby.length, srt = rtts.slice().sort((x, y) => y - x), S = SPEEDS[mp.speed] || SPEEDS.balanced;
   const owd = n === 2 ? srt[0] / 2 : (srt[0] + (srt[1] || 0)) / 2;   // worst client->host->client path
-  const low = mp.prio === 'delay', B = low ? 1 : 4, flushMs = (low || n === 2) ? 0 : 33;
-  const D = clamp(Math.ceil((owd + flushMs + 17) / 16.7) + B, 3, 24);
-  const msg = { t: 'start', mode: mp.mode, prio: mp.prio, players: mp.lobby.slice(), D, B, flushMs };
+  const B = S.B, flushMs = (B === 1 || n === 2) ? 0 : 33;
+  const D = clamp(Math.ceil((owd + flushMs + 17) / 16.7) + B + S.margin, 3, S.max);
+  const msg = { t: 'start', mode: mp.mode, speed: mp.speed, players: mp.lobby.slice(), D, B, flushMs, step: S.step, max: S.max, lower: S.lower };
   jsonClients(msg); mpBegin(msg);
   $('mpStart').disabled = false; $('mpRestart').disabled = false;
 }
 async function mpBegin(m) {
   mpStopTimers();
-  Object.assign(mp, { mode: m.mode, prio: m.prio, players: m.players.slice(), D: m.D, B: m.B, flushMs: m.flushMs, frame: 0, stall: 0, waiting: false, desync: false, checks: 0,
+  Object.assign(mp, { mode: m.mode, speed: m.speed, players: m.players.slice(), D: m.D, B: m.B, flushMs: m.flushMs, lead: m.D, baseLead: m.D, maxLead: m.max, step: m.step, lowerMs: m.lower, lastRaise: 0, lastLower: performance.now(), lastMore: 0, stalls: 0, frame: 0, stall: 0, waiting: false, desync: false, checks: 0,
     mine: {}, remote: {}, outbox: [], runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {}, ghosts: new Map(), lastPos: '', lastPose: '', sentTile: [], sendCount: 0, sinceSend: 0, hostPos: new Map() });
   const split = SPLIT[Math.min(8, m.players.length)];
   m.players.forEach((p, i) => { mp.role8[p] = m.mode === 'split' ? split[i] : 0xFF; });
@@ -680,7 +692,7 @@ async function mpBegin(m) {
     if (!lockstep()) mp.posT = setInterval(hostPosTick, 100);
   }
   const mine = mp.role8[mp.pid];
-  mpStatus(`${mp.mode === 'race' ? 'Race' : mp.mode === 'split' ? 'Co-op (split controls)' : 'Co-op (shared controls)'} · ${m.players.length} players` + (lockstep() ? ` · input delay ${mp.D} frames` : ''));
+  mpStatus(`${mp.mode === 'race' ? 'Race' : mp.mode === 'split' ? 'Co-op (split controls)' : 'Co-op (shared controls)'} · ${m.players.length} players` + (lockstep() ? ` · ${SPEEDS[mp.speed].label} · input delay ${mp.D} frames` : ''));
   mpUi();
   toast(mp.mode === 'race' ? 'Race! The other players are ghost Marios in your world.' : mp.mode === 'split' ? `Co-op: you control ${roleText(mine)}.` : 'Co-op: everyone controls everything.');
 }
@@ -714,11 +726,12 @@ function parseBatches(u, o, count, out) {
 }
 function mpStep(mask) {
   if (!lockstep()) { tuneAudio(); gb.runFrame(); camTrack(cam.me, gb); mp.sinceSend++; return true; }
-  while (mp.queued < mp.frame + mp.D) { mp.inp[mp.pid][mp.queued] = mask; pushMask(mask); mp.queued++; if (mp.queued - mp.sentUpTo >= mp.B) flushLocal(); }
+  if (mp.lead > mp.baseLead && mp.lowerMs && performance.now() - Math.max(mp.lastRaise, mp.lastLower) > mp.lowerMs) { mp.lead--; mp.lastLower = performance.now(); leadChanged(); }
+  while (mp.queued < mp.frame + mp.lead) { mp.inp[mp.pid][mp.queued] = mask; pushMask(mask); mp.queued++; if (mp.queued - mp.sentUpTo >= mp.B) flushLocal(); }
   const f = mp.frame; let comb = 0, miss = null;
   for (const p of mp.players) { const v = mp.inp[p][f]; if (v !== undefined) comb |= v & mp.role8[p]; else if (f < mp.dropFrom[p]) (miss || (miss = [])).push(p); }
   if (miss) {
-    if (mp.stall === 0) flushLocal();                    // never sit on inputs the others may be waiting for
+    if (mp.stall === 0) { flushLocal(); mp.stalls++; askForMore(miss); }   // never sit on inputs the others may be waiting for; ask the late player(s) to lead more
     if (++mp.stall === 30) { mp.waiting = true; $('hint').textContent = 'WAITING FOR ' + miss.map(nameOf).join(', ').toUpperCase() + '…'; }
     return false;
   }
@@ -732,6 +745,16 @@ function mpStep(mask) {
   }
   mp.frame++; return true;
 }
+// Someone's input arrived late: ask them to run further ahead of their own game (their delay goes up a little, our stalls stop).
+function askForMore(miss) {
+  const now = performance.now(); if (now - mp.lastMore < 800) return; mp.lastMore = now;
+  const pids = miss.filter(p => p !== mp.pid);
+  if (!pids.length) return;
+  if (isHost()) { for (const p of pids) { if (p === 0) raiseLead(); else { const pr = mp.peers.get(p); if (pr) pr.send({ t: 'more' }); } } }
+  else mp.guestPeer.send({ t: 'more', pids });
+}
+function raiseLead() { mp.lead = Math.min(mp.maxLead, mp.lead + mp.step); mp.lastRaise = performance.now(); leadChanged(); }
+function leadChanged() { mpStatus(`${SPEEDS[mp.speed].label} · ${mp.players.length} players · input delay ${mp.lead} frames`); }
 function mpCheck(k) {
   if (mp.mine[k] === undefined || mp.remote[k] === undefined) return;
   mp.checks++;
@@ -850,6 +873,7 @@ async function copyText(t, btn) {
   try { await navigator.clipboard.writeText(t); } catch { const o = $('mpOut'); o.select(); document.execCommand('copy'); }
   if (btn) { const w = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = w, 1200); }
 }
+$('mpMode').addEventListener('change', () => { $('mpSpeedRow').hidden = $('mpMode').value === 'race'; });
 $('mpHost').onclick = hostOpenLobby;
 $('mpJoin').onclick = () => { mp.role = 'guest'; mp.stage = 'join'; $('mpCodeIn').value = ''; mpStatus('Enter the host’s 6-character code'); mpUi(); setTimeout(() => $('mpCodeIn').focus(), 50); };
 $('mpGo').onclick = () => {
@@ -961,6 +985,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 }
 
 $('ver').textContent = 'Version ' + APP_VERSION;
+$('mpSpeedRow').hidden = $('mpMode').value === 'race';
 mpUi(); layout();
 window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask, ghosts: mp.ghosts, PERF });
 

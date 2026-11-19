@@ -44,8 +44,11 @@ class Peer {
     dc.onclose = () => this.h.close && this.h.close('closed');
     dc.onmessage = e => {
       const d = e.data;
-      if (typeof d === 'string') { try { this.h.msg && this.h.msg(JSON.parse(d)); } catch {} }
-      else if (this.h.bin) this.h.bin(new Uint8Array(d));
+      const deliver = () => {
+        if (typeof d === 'string') { try { this.h.msg && this.h.msg(JSON.parse(d)); } catch {} }
+        else if (this.h.bin) this.h.bin(new Uint8Array(d));
+      };
+      if (root.__jitterMs) setTimeout(deliver, root.__jitterMs()); else deliver();   // test hook: simulate a bad connection
     };
   }
   async host() {

@@ -15,6 +15,6 @@ Menu → Multiplayer. One host, up to 7 friends, joined with a 6-character code 
 
 - **Race** (Super Mario Land): everyone plays their own game; the others appear as numbered ghost Marios in your world. Only Mario's position/pose is shared (a few hundred bytes per second), nothing is simulated for other players, and pausing can't desync anything.
 - **Co-op**: everyone controls one Mario in lockstep. Split controls hand each player a share of the buttons (up to one button each at 8 players); shared lets everyone press everything. A paused player pauses the game for everybody.
-- Priority: *Low data* batches inputs (default); *Low delay* sends every frame.
+- Speed (co-op): *Steady* (smoothest, most delay), *Balanced* (default) or *Quick* (least delay, may stutter). The game waits for everyone's input, so a shaky connection shows up as speed changes; the presets trade delay for smoothness, and the delay also adapts while you play (it grows for a player whose input arrives late and shrinks back after a calm spell).
 
 Everyone needs the same ROM file in the app.

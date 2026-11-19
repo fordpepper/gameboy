@@ -214,8 +214,8 @@
       <div class="row col" id="mpOptsRow" hidden>
         <div class="row"><div class="lbl">Mode<small>Race: everyone plays their own game and sees the others as ghosts (Super Mario Land). Co-op: everyone steers one Mario together.</small></div>
           <select id="mpMode"><option value="race">Race (ghosts)</option><option value="split">Co-op: split controls</option><option value="shared">Co-op: shared controls</option></select></div>
-        <div class="row"><div class="lbl">Priority<small>Low data sends fewer, bigger messages. Low delay sends every frame (co-op only).</small></div>
-          <select id="mpPrio"><option value="data">Low data</option><option value="delay">Low delay</option></select></div></div>
+        <div class="row" id="mpSpeedRow"><div class="lbl">Speed (co-op)<small>The game waits for everyone, so a shaky connection makes the speed flutter. Steady adds delay so it doesn’t; Quick has the least delay but may stutter. It also adapts while you play.</small></div>
+          <select id="mpSpeed"><option value="steady">Steady: smoothest, most delay</option><option value="balanced" selected>Balanced (recommended)</option><option value="quick">Quick: least delay, may stutter</option></select></div>
       <div class="row" id="mpStartRow" hidden><button id="mpStart" class="primary" disabled>Start</button><button id="mpRestart" hidden>Restart together</button></div>
       <div class="row" id="mpGhostRow" hidden><div class="lbl">Show other players as ghosts</div><label class="sw"><input type="checkbox" id="ghostSw"><span></span></label></div>
       <div class="row col" id="mpManual"><div class="lbl"><small>Can’t connect with a code? Use long manual codes instead (no code service needed):</small></div>
@@ -244,8 +244,8 @@
 <div id="toast"></div>
 <label id="hapl"><input type="checkbox" switch id="hapi"></label>
 
-<script src="gb.js?v=12"></script>
-<script src="net.js?v=12"></script>
-<script src="app.js?v=12"></script>
+<script src="gb.js?v=13"></script>
+<script src="net.js?v=13"></script>
+<script src="app.js?v=13"></script>
 </body>
 </html>
