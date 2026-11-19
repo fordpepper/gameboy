@@ -3,7 +3,7 @@
 const $ = id => document.getElementById(id);
 const canvas = $('lcd'), ctx = canvas.getContext('2d', { alpha: false });
 const root = document.documentElement;
-const APP_VERSION = '13';   // bump together with index.html (?v=) and sw.js; both players must match
+const APP_VERSION = '14';   // bump together with index.html (?v=) and sw.js; both players must match
 const IS_IPAD = /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 /* ---------------------------------------------------------- settings */
@@ -349,15 +349,15 @@ const MASK_NAMES = ['→', '←', '↑', '↓', 'A', 'B', 'Sel', 'Start'];
 const maskText = m => MASK_NAMES.filter((_, i) => m & (1 << i)).join(' ') || '–';
 
 /* ---------------------------------------------------------- main loop
-   Locked to the screen: every display refresh runs exactly one emulated frame (2 on a 30 Hz low-power
-   display, every 2nd on 120 Hz). The refresh rate is measured over long windows of rAF timestamps and
-   snapped to a standard rate, so jitter never causes a skipped or doubled frame. Games run at 60 fps
-   (hardware: 59.73); audio absorbs the 0.45% difference. When paused the loop stops entirely (no wake-ups). */
+   Game speed follows the real clock (60 fps; hardware: 59.73, audio absorbs the 0.45%), independent of how many
+   refreshes the browser delivers: normally one frame per refresh on a 60 Hz screen, every 2nd on 120 Hz, a 2/3
+   cadence on odd rates, with dropped refreshes absorbed and only repeated misses caught up. The measured refresh
+   rate is only used to ease the picture on uneven rates. When paused the loop stops entirely (no wake-ups). */
 const TARGET_FPS = 60, SNAP = [24, 25, 30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 240];
-let raf = 0, last = 0, acc = 0, dispHz = 60, smoothTicks = false;
+let raf = 0, last = 0, due = 0, dispHz = 60, smoothTicks = false;
 let frames = 0, fpsT = 0, produced = 0, fillAvg = AUDIO_TARGET, lastMask = 0;
 const PERF = { work: new Float32Array(600), dt: new Float32Array(600), i: 0, workMax: 0, late: 0, ticks: 0, multi: 0, skipped: 0 };
-function kick() { if (!raf) { last = 0; dtWin.length = 0; raf = requestAnimationFrame(frame); } }
+function kick() { if (!raf) { last = 0; due = 0; dtWin.length = 0; raf = requestAnimationFrame(frame); } }
 
 function applyRate() {
   const uneven = Math.abs(dispHz - TARGET_FPS) >= 3 && Math.abs(Math.round(dispHz / TARGET_FPS) - dispHz / TARGET_FPS) > 0.02 && dispHz > TARGET_FPS;
@@ -376,7 +376,7 @@ function measureRefresh(ts, dt) {
   const s = SNAP.reduce((x, y) => Math.abs(y - hz) < Math.abs(x - hz) ? y : x);
   const cand = Math.abs(s - hz) / s < 0.05 ? s : Math.round(hz * 10) / 10;
   if (cand === dispHz) { pendingHz = 0; return; }
-  if (pendingHz === cand) { dispHz = cand; pendingHz = 0; acc = 0; applyRate(); }   // changed twice in a row: believe it
+  if (pendingHz === cand) { dispHz = cand; pendingHz = 0; applyRate(); }   // changed twice in a row: believe it
   else pendingHz = cand;
 }
 function tuneAudio() {
@@ -402,12 +402,20 @@ function frame(ts) {
     gb.setPad(mask); showPressed(mask);
     let n = 0;
     if (ff && !mp.active) n = 4;
-    else if (Math.abs(dispHz - TARGET_FPS) < 3) n = 1;                      // ~60 Hz screen: exactly one frame per refresh, always
-    else { acc += TARGET_FPS / dispHz; while (acc >= 0.999 && n < 4) { acc -= 1; n++; } if (acc > 4) acc = 0; }
+    else {
+      // Game speed follows the real clock, not the number of refreshes the browser happens to deliver, so a
+      // dropped refresh can never slow the game down. due = frames' worth of time that has passed.
+      // One frame per ~16.7 ms; a single missed refresh is simply absorbed (we stay one frame behind, which is
+      // invisible); only when we're more than 1.5 frames behind do we run an extra frame to catch up.
+      due += Math.min(dt, 100) * TARGET_FPS / 1000;
+      n = due >= 0.5 ? 1 : 0;
+      if (due - n >= 1.5) n += Math.min(3, Math.floor(due - n - 0.5));
+      due -= n; if (due > 6) due = 0;
+    }
     if (n > 1 && !ff && Math.abs(dispHz - TARGET_FPS) < 3) PERF.multi++;
     if (mp.active) {
       let adv = 0;
-      for (let i = 0; i < n; i++) { if (mpStep(mask)) adv++; else { acc = 0; break; } }
+      for (let i = 0; i < n; i++) { if (mpStep(mask)) adv++; else { due = 0; break; } }
       if (adv) {
         if (!lockstep() && mp.sinceSend >= CADENCE) { mp.sinceSend = 0; ghostCapture(); }
         mpGhost(); present(); produced += adv;
