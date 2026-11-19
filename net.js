@@ -1,0 +1,69 @@
+'use strict';
+/* Serverless two-player transport: a WebRTC data channel set up by swapping two short codes
+   (offer / answer) through any chat app. No signalling server involved.
+   Google's public STUN server is used only to discover the public address for the connection. */
+(function (root) {
+
+const ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+const b64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function pipe(data, stream) {
+  const w = stream.writable.getWriter(); w.write(data); w.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+async function encode(obj) {
+  const raw = new TextEncoder().encode(JSON.stringify(obj));
+  if (typeof CompressionStream !== 'undefined') return 'z' + b64(await pipe(raw, new CompressionStream('deflate')));
+  return 'r' + b64(raw);
+}
+async function decode(code) {
+  code = code.replace(/\s+/g, '');
+  const kind = code[0], bytes = unb64(code.slice(1));
+  const raw = kind === 'z' ? await pipe(bytes, new DecompressionStream('deflate')) : bytes;
+  return JSON.parse(new TextDecoder().decode(raw));
+}
+
+class Peer {
+  constructor(h) {
+    this.h = h; this.dc = null;
+    this.pc = new RTCPeerConnection({ iceServers: ICE });
+    this.pc.onconnectionstatechange = () => { const s = this.pc.connectionState; if (h.state) h.state(s); if (s === 'failed' || s === 'closed' || s === 'disconnected') { if (h.close) h.close(s); } };
+  }
+  _gathered() {
+    return new Promise(res => {
+      const pc = this.pc, done = () => { pc.removeEventListener('icegatheringstatechange', f); res(); };
+      const f = () => { if (pc.iceGatheringState === 'complete') done(); };
+      if (pc.iceGatheringState === 'complete') return res();
+      pc.addEventListener('icegatheringstatechange', f); setTimeout(done, 5000);
+    });
+  }
+  _setup(dc) {
+    this.dc = dc;
+    dc.onopen = () => this.h.open && this.h.open();
+    dc.onclose = () => this.h.close && this.h.close('closed');
+    dc.onmessage = e => { try { this.h.msg(JSON.parse(e.data)); } catch {} };
+  }
+  async host() {
+    this._setup(this.pc.createDataChannel('gb', { ordered: true }));
+    await this.pc.setLocalDescription(await this.pc.createOffer());
+    await this._gathered();
+    return encode(this.pc.localDescription.toJSON());
+  }
+  async join(code) {
+    this.pc.ondatachannel = e => this._setup(e.channel);
+    await this.pc.setRemoteDescription(await decode(code));
+    await this.pc.setLocalDescription(await this.pc.createAnswer());
+    await this._gathered();
+    return encode(this.pc.localDescription.toJSON());
+  }
+  async accept(code) { await this.pc.setRemoteDescription(await decode(code)); }
+  send(o) { if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(o)); }
+  get open() { return !!this.dc && this.dc.readyState === 'open'; }
+  close() { try { this.dc && this.dc.close(); } catch {} try { this.pc.close(); } catch {} }
+}
+
+const fnv = (arr, step = 1) => { let h = 0x811C9DC5; for (let i = 0; i < arr.length; i += step) { h ^= arr[i]; h = Math.imul(h, 0x01000193); } return h >>> 0; };
+
+root.Net = { Peer, fnv };
+})(window);

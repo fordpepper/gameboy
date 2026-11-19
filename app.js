@@ -75,27 +75,28 @@ function present() {
 }
 
 /* ---------------------------------------------------------- emulator state */
-let gb = null, romName = null;
+let gb = null, romName = null, curBytes = null, romHash = 0;
 let paused = false, lastSave = 0;
 
 async function flushSave() {
-  if (!gb || !romName || !gb.ramDirty) return;
+  if (!gb || !romName || !gb.ramDirty || mp.active) return;
   gb.ramDirty = false;
   try { await savePut(romName, gb.getSave()); } catch { gb.ramDirty = true; }
 }
-async function startRom(name, bytes) {
+async function startRom(name, bytes, opts = {}) {
   await flushSave();
   const g = new GB(bytes);
   if (g.cgbOnly) { toast('This is a Game Boy Color-only game (not supported yet)'); return; }
-  if (g.hasBattery) { try { const s = await saveGet(name); if (s) g.loadSave(s.data); } catch {} }
-  gb = g; romName = name;
+  if (g.hasBattery && !opts.fresh) { try { const s = await saveGet(name); if (s) g.loadSave(s.data); } catch {} }
+  gb = g; romName = name; curBytes = bytes; romHash = Net.fnv(bytes, 3);
   g.apu.setRate(audio ? audio.ctx.sampleRate : 44100);
   g.pal.set(DMG.map(toABGR));
   fb8 = new Uint8ClampedArray(g.fb.buffer);
-  g.runFrame(); shown.data.set(fb8); present();
+  // Preview picture from a throw-away emulator so the real one stays at frame 0 (needed for netplay).
+  const pv = new GB(bytes); pv.pal.set(DMG.map(toABGR)); pv.runFrame(); shown.data.set(new Uint8ClampedArray(pv.fb.buffer)); present();
   $('hint').textContent = '';
   closeMenu();
-  store.set('last', name);
+  if (!opts.fresh) store.set('last', name);
   document.title = name.replace(/\.(gbc?|bin)$/i, '');
 }
 
@@ -335,10 +336,17 @@ function frame(ts) {
     const mask = touchMask | kbMask | gp;
     gb.setPad(mask); showPressed(mask);
     let n = 0;
-    if (ff) n = 4;
+    if (ff && !mp.active) n = 4;
     else { acc += TARGET_FPS / dispHz; while (acc >= 0.999 && n < 4) { acc -= 1; n++; } if (acc > 4) acc = 0; }
-    for (let i = 0; i < n; i++) { if (!ff) tuneAudio(); gb.runFrame(); }
-    if (n) { present(); produced += n; }
+    if (mp.active) {
+      let adv = 0;
+      for (let i = 0; i < n; i++) { if (mpStep(mask)) adv++; else { acc = 0; break; } }
+      mpOpp();
+      if (adv) { present(); produced += adv; }
+    } else {
+      for (let i = 0; i < n; i++) { if (!ff) tuneAudio(); gb.runFrame(); }
+      if (n) { present(); produced += n; }
+    }
     if (gb.ramDirty && ts - lastSave > 2000) { lastSave = ts; flushSave(); }
   }
   if (fpsT >= 1000) {
@@ -379,9 +387,173 @@ function layout() {
   canvas.width = 160 * kdev; canvas.height = 144 * kdev;
   canvas.style.width = 160 * s + 'px'; canvas.style.height = 144 * s + 'px';
   st.setProperty('--s', s + 'px');
-  makeGrid(); blit();
+  makeGrid(); blit(); mpLayout(dpr);
 }
 window.addEventListener('resize', layout); window.addEventListener('orientationchange', () => setTimeout(layout, 150));
+
+/* ---------------------------------------------------------- multiplayer
+   Super Mario Land has no multiplayer of its own, so this is netplay around the single-player game.
+   Both devices run the same ROM from a cold start and only exchange controller inputs (the emulator is
+   deterministic, so identical inputs give identical games). Modes:
+     race    each player plays their own Mario; the other player's game is replayed live in a small window
+     split   both control ONE Mario in lockstep: host = D-pad, guest = A/B/Start/Select
+     shared  both control ONE Mario in lockstep, every button works for both
+   Periodic screen checksums are exchanged to detect desyncs. */
+const mp = { peer: null, role: null, mode: 'race', active: false, D: 4, frame: 0, queued: 0, stall: 0, waiting: false, desync: false,
+  hostIn: {}, guestIn: {}, opp: null, oppImg: null, oppIn: [], oppFrame: 0, oppRecv: 0, mine: {}, remote: {}, rtts: [], pendingRom: null, stage: '' };
+const oppCanvas = $('opp'), oppCtx = oppCanvas.getContext('2d', { alpha: false });
+const MODE_NAMES = { race: 'Race', split: 'Co-op (split controls)', shared: 'Co-op (shared controls)' };
+const mpSend = o => mp.peer && mp.peer.send(o);
+function mpStatus(t) { $('mpStatus').textContent = t; }
+function mpUi() {
+  const live = mp.active || (mp.peer && mp.peer.open);
+  $('mpStop').hidden = !mp.peer; $('mpHost').hidden = $('mpJoin').hidden = $('mpModeRow').hidden = !!mp.peer;
+  $('mpPanel').hidden = !mp.peer || live;
+}
+function mpEnd(msg) {
+  const was = mp.peer;
+  if (was) { try { was.send({ t: 'bye' }); } catch {} setTimeout(() => was.close(), 50); }
+  mp.peer = null; mp.active = false; mp.opp = null; mp.oppImg = null; mp.waiting = false;
+  $('oppbox').hidden = true; $('hint').textContent = '';
+  mpStatus(msg || 'Not connected'); mpUi(); if (msg) toast(msg);
+}
+function mpNew() {
+  Object.assign(mp, { active: false, frame: 0, queued: 0, stall: 0, waiting: false, desync: false, hostIn: {}, guestIn: {}, opp: null, oppIn: [], oppFrame: 0, oppRecv: 0, mine: {}, remote: {}, rtts: [], pendingRom: null });
+  mp.peer = new Net.Peer({
+    open: () => { mpStatus('Connected. Checking game…'); mpUi(); if (mp.role === 'host') mpSend({ t: 'hello', rom: romHash, name: romName, mode: mp.mode }); },
+    msg: mpMsg,
+    close: () => { if (mp.peer) mpEnd('Connection lost'); },
+    state: s => { if (!mp.active && s === 'connecting') mpStatus('Connecting…'); },
+  });
+}
+async function mpFindRom(hash) {
+  if (curBytes && romHash === hash) return { name: romName, bytes: curBytes };
+  try { for (const n of await romList()) { const r = await romGet(n); if (r && Net.fnv(r.data, 3) === hash) return { name: n, bytes: r.data }; } } catch {}
+  return null;
+}
+async function mpMsg(m) {
+  switch (m.t) {
+    case 'hello': {
+      mp.mode = m.mode;
+      const r = await mpFindRom(m.rom);
+      if (!r) { mpSend({ t: 'err', msg: 'Your friend needs the same game' }); mpEnd(`You don’t have “${m.name}” (same ROM file needed)`); return; }
+      mp.pendingRom = r; mpSend({ t: 'ready' }); mpStatus('Game found. Waiting for host…'); break;
+    }
+    case 'err': mpEnd(m.msg); break;
+    case 'ready': mpStatus('Measuring connection…'); mpSend({ t: 'ping', n: 0, ts: performance.now() }); break;
+    case 'ping': mpSend({ t: 'pong', n: m.n, ts: m.ts }); break;
+    case 'pong': {
+      mp.rtts.push(performance.now() - m.ts);
+      if (mp.rtts.length < 6) { mpSend({ t: 'ping', n: mp.rtts.length, ts: performance.now() }); break; }
+      const r = mp.rtts.slice().sort((a, b) => a - b)[3];
+      mp.D = clamp(Math.ceil(r / 2 / 16.7) + 2, 3, 12);
+      mpSend({ t: 'start', mode: mp.mode, D: mp.D, rtt: r }); mpBegin(); break;
+    }
+    case 'start': mp.mode = m.mode; mp.D = m.D; mpBegin(); break;
+    case 'i':
+      if (mp.mode === 'race') { mp.oppIn[m.f] = m.m; mp.oppRecv = Math.max(mp.oppRecv, m.f + 1); }
+      else (mp.role === 'host' ? mp.guestIn : mp.hostIn)[m.f] = m.m;
+      break;
+    case 'h': mp.remote[m.f] = m.h; mpCheck(m.f); break;
+    case 'bye': mpEnd('Your friend disconnected'); break;
+  }
+}
+async function mpBegin() {
+  mp.frame = 0; mp.stall = 0; mp.desync = false; mp.mine = {}; mp.remote = {};
+  if (mp.mode !== 'race') { for (let i = 0; i < mp.D; i++) { mp.hostIn[i] = 0; mp.guestIn[i] = 0; } mp.queued = mp.D; }
+  const r = mp.role === 'host' ? { name: romName, bytes: curBytes } : mp.pendingRom;
+  mp.active = false;
+  await startRom(r.name, r.bytes, { fresh: true });
+  if (mp.mode === 'race') {
+    mp.opp = new GB(r.bytes); mp.opp.pal.set(DMG.map(toABGR)); mp.oppImg = new ImageData(new Uint8ClampedArray(mp.opp.fb.buffer), 160, 144);
+    oppCtx.fillStyle = DMG[0]; oppCtx.fillRect(0, 0, 160, 144); $('oppbox').hidden = false; mpLayout();
+  }
+  ff = false; $('ffSw').checked = false;
+  mp.active = true; paused = false;
+  mpStatus(`${MODE_NAMES[mp.mode]} · delay ${mp.mode === 'race' ? 0 : mp.D} frames`); mpUi();
+  toast(mp.mode === 'race' ? 'Race! Your friend’s screen is in the corner.' : mp.role === 'host' ? 'Co-op started. You have the D-pad.' : 'Co-op started. You have the buttons.');
+  if (mp.mode === 'split' && mp.role === 'host') toast('Co-op started: you steer (D-pad), your friend jumps and runs (A/B).');
+}
+function mpCheck(k) {
+  if (mp.mine[k] === undefined || mp.remote[k] === undefined) return;
+  mp.checks = (mp.checks | 0) + 1;
+  if (mp.mine[k] !== mp.remote[k] && !mp.desync) { mp.desync = true; toast('The two games went out of sync. Disconnect and start again.'); }
+  delete mp.mine[k]; delete mp.remote[k];
+}
+// Local game advanced one frame; share/compare checksums every 120 frames.
+function mpHash(frameIdx, emu, mirrored) {
+  if ((frameIdx + 1) % 120) return;
+  const h = Net.fnv(emu.fb);
+  if (mirrored) { mp.mine[frameIdx] = h; mpCheck(frameIdx); } else mpSend({ t: 'h', f: frameIdx, h });
+}
+function mpStep(mask) {
+  if (mp.mode === 'race') {
+    gb.setPad(mask); mpSend({ t: 'i', f: mp.frame, m: mask });
+    tuneAudio(); gb.runFrame(); mpHash(mp.frame, gb, false); mp.frame++; return true;
+  }
+  const mine = mp.role === 'host' ? mp.hostIn : mp.guestIn;
+  while (mp.queued < mp.frame + mp.D) { mine[mp.queued] = mask; mpSend({ t: 'i', f: mp.queued, m: mask }); mp.queued++; }
+  const hm = mp.hostIn[mp.frame], gm = mp.guestIn[mp.frame];
+  if (hm === undefined || gm === undefined) {
+    if (++mp.stall === 40) { mp.waiting = true; $('hint').textContent = 'WAITING FOR PARTNER…'; }
+    return false;
+  }
+  if (mp.waiting) { mp.waiting = false; $('hint').textContent = ''; }
+  mp.stall = 0;
+  gb.setPad(mp.mode === 'split' ? ((hm & 0x0F) | (gm & 0xF0)) : (hm | gm));
+  tuneAudio(); gb.runFrame();
+  delete mp.hostIn[mp.frame]; delete mp.guestIn[mp.frame];
+  mpHash(mp.frame, gb, false); mpHash(mp.frame, gb, true);
+  mp.frame++; return true;
+}
+// Race: replay the friend's inputs on a second emulator, a few frames behind to absorb network jitter.
+function mpOpp() {
+  if (!mp.opp) return;
+  const avail = mp.oppRecv - mp.oppFrame;
+  const k = avail > 60 ? 8 : avail > 30 ? 4 : avail > 6 ? 2 : avail >= 2 ? 1 : 0;
+  for (let i = 0; i < k; i++) {
+    mp.opp.setPad(mp.oppIn[mp.oppFrame] | 0); mp.opp.runFrame();
+    mpHash(mp.oppFrame, mp.opp, true);
+    mp.oppIn[mp.oppFrame] = undefined; mp.oppFrame++;
+  }
+  if (k) oppCtx.putImageData(mp.oppImg, 0, 0);
+}
+function mpLayout(dpr = window.devicePixelRatio || 1) {
+  // Use the empty margin beside the LCD when it's wide enough (no overlap); otherwise a small corner overlay.
+  const margin = (window.innerWidth - 160 * kdev / dpr) / 2 - 20;
+  let k = Math.floor(margin * dpr / 160); if (k < 2) k = Math.max(1, Math.round(kdev * 0.4));
+  const s = k / dpr;
+  oppCanvas.style.width = 160 * s + 'px'; oppCanvas.style.height = 144 * s + 'px';
+}
+
+// --- connect UI
+async function copyText(t, btn) {
+  try { await navigator.clipboard.writeText(t); } catch { const o = $('mpOut'); o.select(); document.execCommand('copy'); }
+  if (btn) { const w = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = w, 1200); }
+}
+$('mpHost').onclick = async () => {
+  if (!gb) { toast('Load a game first'); return; }
+  mp.role = 'host'; mp.mode = $('mpMode').value; mpNew(); mp.stage = 'host';
+  $('mpPanel').hidden = false; $('mpOut').value = ''; $('mpIn').value = ''; $('mpOutLbl').textContent = 'Step 1: send this code to your friend'; $('mpInLbl').textContent = 'Step 2: paste your friend’s reply code';
+  mpStatus('Creating code…'); mpUi();
+  try { $('mpOut').value = await mp.peer.host(); mpStatus('Waiting for your friend’s reply code'); } catch (e) { mpEnd('Could not create code: ' + e.message); }
+};
+$('mpJoin').onclick = () => {
+  mp.role = 'guest'; mpNew(); mp.stage = 'join';
+  $('mpPanel').hidden = false; $('mpOut').value = ''; $('mpIn').value = ''; $('mpOutLbl').textContent = 'Step 2: send this reply code back to the host'; $('mpInLbl').textContent = 'Step 1: paste the host’s code';
+  mpStatus('Paste the host’s code'); mpUi();
+};
+$('mpGo').onclick = async () => {
+  const code = $('mpIn').value.trim(); if (!code || !mp.peer) return;
+  try {
+    if (mp.stage === 'join') { mpStatus('Creating reply…'); $('mpOut').value = await mp.peer.join(code); mpStatus('Send your reply code to the host'); }
+    else { mpStatus('Connecting…'); await mp.peer.accept(code); }
+  } catch (e) { mpStatus('That code didn’t work: ' + e.message); }
+};
+$('mpPaste').onclick = async () => { try { $('mpIn').value = await navigator.clipboard.readText(); } catch { $('mpIn').focus(); toast('Long-press the box and choose Paste'); } };
+$('mpCopy').onclick = e => copyText($('mpOut').value, e.target);
+if (navigator.share) $('mpShare').onclick = () => navigator.share({ text: $('mpOut').value }).catch(() => {}); else $('mpShare').hidden = true;
+$('mpStop').onclick = () => mpEnd('Disconnected');
 
 /* ---------------------------------------------------------- menu */
 function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = 'none', 4500); }
@@ -441,8 +613,8 @@ $('resetBtn').onclick = () => { if (gb) { flushSave(); const rn = romName; romGe
 // Offline support (HTTPS / localhost only).
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
 
-layout();
-window.__gb = () => ({ gb, audio, dispHz, mode, kdev });
+mpUi(); layout();
+window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp });
 
 // Resume the last game (after a tap, so audio and fullscreen are allowed to start), otherwise show the menu.
 (async () => {

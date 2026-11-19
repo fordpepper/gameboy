@@ -23,6 +23,7 @@
     --ink: #eceef3; --dim: #8d92a0; --accent: #a6c13a;
     --key: #272a33; --key-on: #d3d6df; --key-ink: #8d92a0;
   }
+  [hidden] { display: none !important; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden; overscroll-behavior: none;
     font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
@@ -44,7 +45,7 @@
     box-shadow: inset calc(var(--s) * .55) calc(var(--s) * .8) calc(var(--s) * 1.1) rgba(0,0,0,.42), inset calc(var(--s) * -.15) calc(var(--s) * -.2) calc(var(--s) * .4) rgba(0,0,0,.18); }
   #lcdbox.plain #lcdfx { display: none; }
   #hint { position: absolute; pointer-events: none; color: #1f2c18; font: 700 calc(var(--s) * 5) ui-monospace, Menlo, monospace; text-align: center; letter-spacing: .04em; opacity: .85; }
-  #fps { position: absolute; left: calc(env(safe-area-inset-left) + 12px); top: calc(env(safe-area-inset-top) + 10px); font: 12px ui-monospace, monospace; color: var(--accent); display: none; z-index: 4; text-shadow: 0 1px 2px #000; }
+  #fps { position: absolute; left: 50%; transform: translateX(-50%); top: calc(env(safe-area-inset-top) + 10px); font: 12px ui-monospace, monospace; color: var(--accent); display: none; z-index: 4; text-shadow: 0 1px 2px #000; }
 
   /* ---------------- touch controls: flat, opaque, minimal ---------------- */
   .pad { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; touch-action: none;
@@ -126,6 +127,15 @@
   input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 28px; height: 28px; margin-top: -11.5px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.5); }
   input[type=range]::-moz-range-track { height: 5px; border-radius: 3px; background: #3a3e4a; }
   input[type=range]::-moz-range-thumb { width: 28px; height: 28px; border: 0; border-radius: 50%; background: #fff; }
+  .row.col { flex-direction: column; align-items: stretch; }
+  .row.col .row { margin: 0; } .row.col .row button { flex: 1; }
+  textarea { width: 100%; background: #14161b; color: var(--ink); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; font: 12px ui-monospace, Menlo, monospace; resize: none; user-select: text; -webkit-user-select: text; }
+  select { font: inherit; color: var(--ink); background: #2d313b; border: 0; border-radius: 12px; padding: 11px 12px; max-width: 48%; }
+  #oppbox { position: absolute; z-index: 3; left: calc(env(safe-area-inset-left) + 12px); top: calc(env(safe-area-inset-top) + 12px); line-height: 0; pointer-events: none;
+    border-radius: 3px; overflow: hidden; box-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 8px 24px rgba(0,0,0,.5); opacity: .95; }
+  #oppbox[hidden] { display: none; }
+  #opp { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+  #oppbox span { position: absolute; left: 4px; top: 3px; font: 700 10px/1 -apple-system, system-ui, sans-serif; letter-spacing: .1em; color: #fff; background: rgba(0,0,0,.45); padding: 3px 5px; border-radius: 4px; }
   .tip { color: var(--dim); font-size: 13px; line-height: 1.5; padding: 4px 4px 0; }
   #toast { position: absolute; z-index: 20; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 24px); transform: translateX(-50%); max-width: 90%; text-align: center;
     background: rgba(20,22,28,.95); border: 1px solid var(--line); padding: 10px 16px; border-radius: 14px; display: none; font-size: 14px; }
@@ -152,6 +162,7 @@
     </div>
     <div class="sm" id="start" data-b="7">START</div>
   </div>
+  <div id="oppbox" hidden><canvas id="opp" width="160" height="144"></canvas><span>FRIEND</span></div>
   <div id="fps"></div>
   <div id="topbtns">
     <button class="ico" id="sndBtn" aria-label="Sound"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path id="sndWaves" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg></button>
@@ -187,6 +198,21 @@
       <div class="row"><div class="lbl">Status<small id="sndStatus">–</small></div><button id="testSnd">Test beep</button></div>
     </div>
 
+    <h3>Multiplayer</h3>
+    <div class="card">
+      <div class="row"><div class="lbl">Play online with a friend<small id="mpStatus">Not connected</small></div><button id="mpStop" hidden>Disconnect</button></div>
+      <div class="row" id="mpModeRow"><div class="lbl">Mode<small>Race: each plays their own game. Co-op: you share one Mario.</small></div>
+        <select id="mpMode"><option value="race">Race</option><option value="split">Co-op: split controls</option><option value="shared">Co-op: shared controls</option></select></div>
+      <div class="row"><button id="mpHost" class="primary">Host a game</button><button id="mpJoin">Join a game</button></div>
+      <div id="mpPanel" hidden>
+        <div class="row col"><div class="lbl" id="mpOutLbl">Your code</div><textarea id="mpOut" readonly rows="3" placeholder="…"></textarea>
+          <div class="row"><button id="mpCopy">Copy</button><button id="mpShare">Share…</button></div></div>
+        <div class="row col"><div class="lbl" id="mpInLbl">Friend’s code</div><textarea id="mpIn" rows="3" placeholder="Paste here"></textarea>
+          <div class="row"><button id="mpPaste">Paste</button><button id="mpGo" class="primary">Connect</button></div></div>
+      </div>
+    </div>
+    <div class="tip">Both of you need the same ROM file loaded in the app. Super Mario Land itself is single-player, so this runs the game in sync on both devices. Connection is direct between the two devices.</div>
+
     <h3>Game</h3>
     <div class="card">
       <div class="row"><div class="lbl">Fast-forward</div><label class="sw"><input type="checkbox" id="ffSw"><span></span></label></div>
@@ -201,6 +227,7 @@
 <label id="hapl"><input type="checkbox" switch id="hapi"></label>
 
 <script src="gb.js"></script>
+<script src="net.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
