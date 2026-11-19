@@ -1,5 +1,5 @@
 // Network-first service worker: always picks up new versions when online, works offline from cache otherwise.
-const V = 'gb-v7';
+const V = 'gb-v9';
 const ASSETS = ['./', 'index.html', 'gb.js', 'net.js', 'app.js', 'manifest.webmanifest', 'icon.png'];
 self.addEventListener('install', e => e.waitUntil(caches.open(V).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(

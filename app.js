@@ -18,7 +18,7 @@ const PAL32 = new Uint32Array(DMG.map(toABGR));
 let volume = store.get('vol', 0.8), ff = false, showFps = store.get('fps', false);
 let lcdFx = store.get('fx', true), clickFb = store.get('click', true);
 let ctrlSize = store.get('csize', 1), ctrlLift = store.get('clift', 0.35);
-let ghostOn = store.get('ghost', true), oppWin = store.get('oppwin', false);
+let ghostOn = store.get('ghost', true);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 /* ---------------------------------------------------------- storage (IndexedDB) */
@@ -185,20 +185,28 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => { flushSave(); releaseAllInputs(); });
 
-/* ---------------------------------------------------------- fullscreen */
+/* ---------------------------------------------------------- fullscreen
+   Touch devices (iPad): try to go fullscreen on the first tap (and the home-screen app is fullscreen anyway).
+   Desktop: only if the browser window is already maximized, only once, and never again after you leave
+   fullscreen yourself. */
+const TOUCH_PRIMARY = matchMedia('(pointer: coarse)').matches;
 const isStandalone = () => navigator.standalone || matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches;
 const isFs = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+const windowMaximized = () => Math.abs(window.outerWidth - screen.availWidth) <= 16 && Math.abs(window.outerHeight - screen.availHeight) <= 16 && window.outerWidth > 0;
+let fsDeclined = false, fsAutoTried = false;
 function goFullscreen() {
   if (isFs() || isStandalone()) return;
+  if (!TOUCH_PRIMARY) { if (fsDeclined || fsAutoTried || !windowMaximized()) return; fsAutoTried = true; }
   const el = root, f = el.requestFullscreen || el.webkitRequestFullscreen;
   if (!f) return;
   try { const r = f.call(el, { navigationUI: 'hide' }); if (r && r.catch) r.catch(() => {}); } catch {}
 }
-document.addEventListener('pointerup', function once() {
+if (TOUCH_PRIMARY) document.addEventListener('pointerup', function once() {
   document.removeEventListener('pointerup', once);
   setTimeout(() => { if (!isFs() && !isStandalone() && !store.get('fsHint', false)) { store.set('fsHint', true); toast('For true fullscreen: Share → Add to Home Screen, then open it from there.'); } }, 700);
 });
-document.addEventListener('fullscreenchange', () => layout()); document.addEventListener('webkitfullscreenchange', () => layout());
+const onFsChange = () => { if (!isFs() && fsAutoTried) fsDeclined = true; layout(); };
+document.addEventListener('fullscreenchange', onFsChange); document.addEventListener('webkitfullscreenchange', onFsChange);
 
 /* ---------------------------------------------------------- feedback (haptics / click)
    iPads have no vibration motor and Safari has no vibration API, so on an iPad the only physical-feeling
@@ -237,6 +245,8 @@ const KEYS = {
   KeyX: 4, KeyK: 4, KeyZ: 5, KeyJ: 5, ShiftLeft: 6, ShiftRight: 6, Backspace: 6, Enter: 7, Space: 7,
 };
 window.addEventListener('keydown', e => {
+  if (e.target && e.target.closest && e.target.closest('input, textarea, select')) return;   // typing a code, etc.
+  if (e.code === 'Escape' || e.code === 'KeyM') { if ($('menu').classList.contains('open')) { if (gb) closeMenu(); } else openMenu(); e.preventDefault(); return; }
   if ($('menu').classList.contains('open')) return;
   const b = KEYS[e.code]; if (b === undefined) return; e.preventDefault(); kbMask |= 1 << b;
   if (performance.now() - lastTouchT > 1500) setMode('ext');
@@ -383,8 +393,10 @@ function frame(ts) {
     if (mp.active) {
       let adv = 0;
       for (let i = 0; i < n; i++) { if (mpStep(mask)) adv++; else { acc = 0; break; } }
-      mpOpp(); if (adv) mpGhost();
-      if (adv) { present(); produced += adv; }
+      if (adv) {
+        if (!lockstep() && mp.sinceSend >= CADENCE) { mp.sinceSend = 0; ghostCapture(); }
+        mpGhost(); present(); produced += adv;
+      }
     } else {
       for (let i = 0; i < n; i++) { if (!ff) tuneAudio(); gb.runFrame(); }
       if (n) { present(); produced += n; }
@@ -428,157 +440,290 @@ function layout() {
   canvas.style.width = 160 * s + 'px'; canvas.style.height = 144 * s + 'px';
   st.setProperty('--s', s + 'px');
   if (k !== kdev) { kdev = k; makeGridImage(k); }
-  rects = null; mpLayout(dpr);
+  rects = null;
 }
 let layoutT = 0;
 const relayout = () => { clearTimeout(layoutT); layoutT = setTimeout(layout, 60); };
 window.addEventListener('resize', () => { relayout(); touchHeld.clear(); touchMask = 0; });
 window.addEventListener('orientationchange', () => { relayout(); setTimeout(layout, 300); touchHeld.clear(); touchMask = 0; });
 
-/* ---------------------------------------------------------- multiplayer
-   Super Mario Land has no multiplayer of its own, so this is netplay around the single-player game.
-   Both devices run the same ROM from a cold start and only exchange controller inputs (the emulator is
-   deterministic, so identical inputs give identical games). Modes:
-     race    each player plays their own Mario; the other player's game is replayed on a second emulator and,
-             in Super Mario Land, shown as a ghost Mario in your world (plus an optional picture-in-picture)
-     split   both control ONE Mario in lockstep: host = D-pad, guest = A/B/Start/Select
-     shared  both control ONE Mario in lockstep, every button works for both
-   Periodic screen checksums are exchanged to detect desyncs. */
-const mp = { peer: null, role: null, mode: 'race', active: false, D: 4, frame: 0, queued: 0, stall: 0, waiting: false, desync: false, sub: null, stage: '',
-  hostIn: {}, guestIn: {}, opp: null, oppImg: null, oppIn: [], oppFrame: 0, oppRecv: 0, mine: {}, remote: {}, rtts: [], pendingRom: null, checks: 0 };
-const oppCanvas = $('opp'), oppCtx = oppCanvas.getContext('2d', { alpha: false });
-const MODE_NAMES = { race: 'Race', split: 'Co-op (split controls)', shared: 'Co-op (shared controls)' };
-const mpSend = o => mp.peer && mp.peer.send(o);
+/* ---------------------------------------------------------- multiplayer (up to 8 players)
+   Topology: a star. Everyone connects directly to the host over WebRTC; the host relays. Each client sends one
+   stream and receives one stream, so per-player traffic doesn't grow with the number of players on the client side.
+   Super Mario Land has no multiplayer of its own, so two kinds of session exist:
+
+   RACE   Everybody plays their own game. Each player shares only a few bytes of state about their Mario
+          (level, world position, pose) ~10x a second and only when it changed, and everyone sees the others as
+          ghost Marios in their own world. Nothing is simulated for other players (no extra CPU/battery) and
+          nothing can desync, so pausing is harmless: a paused player's ghost just stops.
+   CO-OP  Everybody controls ONE Mario, in lockstep: all devices run the same game and exchange only controller
+          inputs (batched, run-length encoded, binary). 'split' hands each player a share of the buttons
+          (2 players: D-pad / buttons; up to 8: one button each); 'shared' lets everyone press everything.
+          Lockstep means a paused player pauses the game for everyone (the screen says who we're waiting for).
+
+   Data per player is tiny by design (a few hundred bytes/s). The "Low delay" option trades some of that for
+   lower input delay (fewer, bigger batches vs. one message per frame). */
+const MAXP = 8, GHOST_MS = 110, GHOST_STALE = 3000, CADENCE = 6;
+const mp = { role: null, pid: 0, stage: 'idle', code: '', sub: null, peers: new Map(), pending: new Map(), nextPid: 1, guestPeer: null, guestId: '', pendingRom: null,
+  lobby: [], mode: 'race', prio: 'data', active: false, players: [], D: 6, B: 4, flushMs: 0, frame: 0, queued: 0, sentUpTo: 0, runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {},
+  outbox: [], flushT: 0, posT: 0, stall: 0, waiting: false, mine: {}, remote: {}, checks: 0, desync: false, manual: '',
+  ghosts: new Map(), lastPos: '', lastPose: '', sentTile: [], sendCount: 0, sinceSend: 0, hostPos: new Map() };
+const nameOf = pid => 'P' + (pid + 1);
+const BTN_LABEL = ['Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start'];
+const roleText = m => m === 0xFF ? 'everything' : BTN_LABEL.filter((_, i) => m & (1 << i)).join(', ');
+// Which buttons each player owns in 'split' mode, by number of players.
+const SPLIT = { 1: [0xFF], 2: [0x0F, 0xF0], 3: [0x0F, 0x10, 0xE0], 4: [0x03, 0x10, 0x20, 0xCC], 5: [0x02, 0x01, 0x10, 0x20, 0xCC], 6: [0x02, 0x01, 0x10, 0x20, 0x0C, 0xC0],
+  7: [0x02, 0x01, 0x10, 0x20, 0x0C, 0x40, 0x80], 8: [0x02, 0x01, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80] };
+const u32 = v => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255];
+const r16 = (u, o) => u[o] | (u[o + 1] << 8), r32 = (u, o) => (u[o] | (u[o + 1] << 8) | (u[o + 2] << 16) | (u[o + 3] << 24)) >>> 0;
+const isHost = () => mp.role === 'host';
+const lockstep = () => mp.mode !== 'race';
+
 function mpStatus(t) { $('mpStatus').textContent = t; }
+function toHost(u8) { if (mp.guestPeer) mp.guestPeer.sendBin(u8); }
+function toClients(u8, except = -1) { for (const [pid, p] of mp.peers) if (pid !== except) p.sendBin(u8); }
+function jsonClients(o) { for (const p of mp.peers.values()) p.send(o); }
+
+/* ---- UI ---- */
+function renderPlayers() {
+  const el = $('mpPlayers'); el.textContent = '';
+  const ids = mp.active ? mp.players : mp.lobby;
+  for (const pid of ids) {
+    const row = document.createElement('div'); row.className = 'prow';
+    const dot = document.createElement('i'); dot.textContent = pid + 1;
+    const t = document.createElement('span'); t.textContent = (pid === mp.pid ? 'You' : nameOf(pid)) + (pid === 0 ? ' · host' : '');
+    row.append(dot, t);
+    if (mp.active && mp.mode === 'split') { const s = document.createElement('small'); s.textContent = roleText(mp.role8[pid]); row.append(s); }
+    el.append(row);
+  }
+}
 function mpUi() {
-  const live = mp.active || (mp.peer && mp.peer.open);
-  const idle = !mp.peer;
-  $('mpStop').hidden = idle; $('mpModeRow').hidden = $('mpBtns').hidden = !idle;
-  $('mpHostBox').hidden = !(mp.peer && !live && mp.stage === 'host');
-  $('mpJoinBox').hidden = !(mp.peer && !live && mp.stage === 'join');
-  $('mpPanel').hidden = !(mp.peer && !live && (mp.stage === 'mhost' || mp.stage === 'mjoin'));
-  $('mpManual').hidden = !idle;
-  $('mpGhostRow').hidden = $('mpWinRow').hidden = !(mp.active && mp.mode === 'race');
+  const idle = !mp.role, host = isHost(), guest = mp.role === 'guest';
+  const lobby = !!mp.role && !mp.active && mp.stage !== 'join';
+  $('mpStop').hidden = idle; $('mpStop').textContent = host ? 'Close' : 'Leave';
+  $('mpBtns').hidden = !idle;
+  $('mpHostBox').hidden = !(host && !mp.active);
+  $('mpJoinBox').hidden = !(guest && mp.stage === 'join');
+  $('mpLobby').hidden = !(mp.role && mp.stage !== 'join');
+  $('mpOptsRow').hidden = !(host && !mp.active);
+  $('mpStartRow').hidden = !host;
+  $('mpStart').hidden = mp.active; $('mpStart').disabled = mp.lobby.length < 2;
+  $('mpRestart').hidden = !mp.active;
+  $('mpGhostRow').hidden = !(mp.active && mp.mode === 'race');
+  $('mpManual').hidden = !(idle || (host && !mp.active));
+  $('mpAddM').hidden = !host; $('mpJoinM').hidden = !idle;
+  if (!(host && mp.manual === 'add') && !(guest && mp.manual === 'join')) $('mpPanel').hidden = true;
+  renderPlayers(); applyRoleUi();
 }
+function applyRoleUi() {
+  const m = mp.active && mp.mode === 'split' ? mp.role8[mp.pid] : 0xFF;
+  btnEls.forEach(el => el.classList.toggle('off', !(m & (1 << +el.dataset.b))));
+  dirEls.forEach(el => el.classList.toggle('off', !(m & (1 << +el.dataset.d))));
+}
+
+/* ---- teardown ---- */
 function mpClean() { if (mp.sub) { try { mp.sub(); } catch {} mp.sub = null; } }
+function mpStopTimers() { clearInterval(mp.flushT); clearInterval(mp.posT); mp.flushT = mp.posT = 0; }
 function mpEnd(msg) {
-  const was = mp.peer; mpClean();
-  if (was) { try { was.send({ t: 'bye' }); } catch {} setTimeout(() => was.close(), 50); }
-  mp.peer = null; mp.active = false; mp.opp = null; mp.oppImg = null; mp.waiting = false; mp.stage = '';
-  $('oppbox').hidden = true; $('hint').textContent = '';
-  mpStatus(msg || 'Not connected'); mpUi(); if (msg) toast(msg);
+  mpClean(); mpStopTimers();
+  if (mp.guestPeer) { try { mp.guestPeer.send({ t: 'bye' }); } catch {} const p = mp.guestPeer; setTimeout(() => p.close(), 50); }
+  for (const p of [...mp.peers.values(), ...mp.pending.values()]) { try { p.send({ t: 'bye' }); } catch {} setTimeout(() => p.close(), 50); }
+  Object.assign(mp, { role: null, pid: 0, stage: 'idle', code: '', peers: new Map(), pending: new Map(), nextPid: 1, guestPeer: null, pendingRom: null, lobby: [], active: false, players: [], waiting: false, manual: '', ghosts: new Map(), outbox: [] });
+  $('hint').textContent = ''; mpStatus(msg || 'Not connected'); mpUi(); if (msg) toast(msg);
 }
-function mpNew() {
-  mpClean();
-  Object.assign(mp, { active: false, frame: 0, queued: 0, stall: 0, waiting: false, desync: false, hostIn: {}, guestIn: {}, opp: null, oppIn: [], oppFrame: 0, oppRecv: 0, mine: {}, remote: {}, rtts: [], pendingRom: null, checks: 0 });
-  mp.peer = new Net.Peer({
-    open: () => { mpClean(); mpStatus('Connected. Checking game…'); mpUi(); if (mp.role === 'host') mpSend({ t: 'hello', rom: romHash, name: romName, mode: mp.mode }); },
-    msg: mpMsg,
-    close: () => { if (mp.peer) mpEnd('Connection lost'); },
-    state: s => { if (!mp.active && s === 'connecting') mpStatus('Connecting…'); },
+
+/* ---- host: lobby & peers ---- */
+function broadcastLobby() { jsonClients({ t: 'lobby', players: mp.lobby, mode: mp.mode, prio: mp.prio }); mpUi(); mpStatus(`${mp.lobby.length} player${mp.lobby.length > 1 ? 's' : ''} in the lobby`); }
+function hostMakePeer(joinId) {
+  let pid = -1;
+  const peer = new Net.Peer({
+    open() { pid = mp.nextPid++; mp.peers.set(pid, peer); mp.pending.delete(joinId); peer.send({ t: 'hello', pid, rom: romHash, name: romName }); },
+    msg(m) {
+      if (m.t === 'ready') { if (!mp.lobby.includes(pid)) mp.lobby.push(pid); broadcastLobby(); }
+      else if (m.t === 'err') { toast(`${nameOf(pid)}: ${m.msg}`); peer.close(); }
+      else if (m.t === 'pong') { if (peer._pr) peer._pr(performance.now() - m.ts); }
+      else if (m.t === 'ds') toast(`${nameOf(pid)} reports the games went out of sync`);
+      else if (m.t === 'bye') hostDrop(pid);
+    },
+    bin(u) { hostBin(pid, u); },
+    close() { hostDrop(pid); mp.pending.delete(joinId); },
   });
+  return peer;
+}
+function hostDrop(pid) {
+  if (pid < 0 || !mp.peers.has(pid)) return;
+  const p = mp.peers.get(pid); mp.peers.delete(pid); try { p.close(); } catch {}
+  mp.lobby = mp.lobby.filter(x => x !== pid); mp.ghosts.delete(pid);
+  if (mp.active) {
+    if (lockstep()) { mp.dropFrom[pid] = mp.inMax[pid] || 0; jsonClients({ t: 'drop', pid, f: mp.dropFrom[pid] }); }
+    toast(`${nameOf(pid)} left`); renderPlayers();
+    if (!mp.peers.size) mpEnd('Everyone else left');
+  } else broadcastLobby();
+}
+async function hostOpenLobby() {
+  if (!gb) { toast('Load a game first'); return; }
+  mp.role = 'host'; mp.pid = 0; mp.stage = 'lobby'; mp.lobby = [0]; mp.manual = ''; mp.code = Net.newCode();
+  $('mpCode').textContent = fmtCode(mp.code); mpStatus('Opening lobby…'); mpUi();
+  try {
+    mp.sub = Net.subscribe(mp.code, async msg => {
+      const k = msg[0], id = msg.slice(1, 5), rest = msg.slice(5);
+      if (k === 'j') {
+        if (mp.pending.has(id) || mp.peers.size + mp.pending.size >= MAXP - 1 || mp.active) return;
+        const peer = hostMakePeer(id); mp.pending.set(id, peer);
+        try { await Net.publish(mp.code, 'o' + id + await peer.host()); } catch (e) { mpStatus('Code service error: ' + e.message); }
+      } else if (k === 'a') { const peer = mp.pending.get(id); if (peer) peer.accept(rest).catch(() => {}); }
+    }, () => mpStatus('Reconnecting to the code service…'));
+    await Net.publish(mp.code, 'x' + mp.code);  // makes sure the topic is reachable; also fails fast if the service is down
+    mpStatus('Lobby open. Friends enter the code to join (up to 7).');
+  } catch (e) { mpEnd('Couldn’t reach the code service (' + e.message + '). Try “manual codes” below.'); }
+}
+
+/* ---- guest ---- */
+function guestHandlers() {
+  return {
+    msg: async m => {
+      switch (m.t) {
+        case 'hello': {
+          mp.pid = m.pid;
+          const r = await mpFindRom(m.rom);
+          if (!r) { mp.guestPeer.send({ t: 'err', msg: `needs “${m.name}” (same ROM file)` }); mpEnd(`You don’t have “${m.name}”. Add the same ROM file first.`); return; }
+          mp.pendingRom = r; mp.guestPeer.send({ t: 'ready' }); mp.stage = 'lobby'; mpStatus('Joined. Waiting for the host to start…'); mpUi(); break;
+        }
+        case 'lobby': mp.lobby = m.players; mp.mode = m.mode; mp.prio = m.prio; mpStatus(`In lobby (${m.players.length} players). Waiting for the host…`); mpUi(); break;
+        case 'start': mpBegin(m); break;
+        case 'ping': mp.guestPeer.send({ t: 'pong', ts: m.ts }); break;
+        case 'h': mp.remote[m.f] = m.h; mpCheck(m.f); break;
+        case 'drop': mp.dropFrom[m.pid] = m.f; mp.ghosts.delete(m.pid); mp.players = mp.players.filter(p => p !== m.pid || lockstep()); toast(`${nameOf(m.pid)} left`); break;
+        case 'bye': mpEnd('The host closed the game'); break;
+      }
+    },
+    bin: u => guestBin(u),
+    close: () => { if (mp.guestPeer) mpEnd('Connection lost'); },
+    state: s => { if (!mp.active && s === 'connecting') mpStatus('Connecting…'); },
+  };
+}
+async function guestJoin(code) {
+  mp.role = 'guest'; mp.stage = 'join'; mp.guestPeer = new Net.Peer(guestHandlers()); mp.guestId = Net.newCode().slice(0, 4);
+  mpStatus('Looking for the host…'); mpUi(); let got = false;
+  const timer = setTimeout(() => { if (!got) { mpEnd('No game found for that code. Check the code and that the host has the lobby open.'); } }, 20000);
+  mp.sub = Net.subscribe(code, async msg => {
+    if (msg[0] !== 'o' || msg.slice(1, 5) !== mp.guestId || got) return; got = true; clearTimeout(timer);
+    try { mpStatus('Connecting…'); const ans = await mp.guestPeer.join(msg.slice(5)); await Net.publish(code, 'a' + mp.guestId + ans); }
+    catch (e) { mpEnd('Couldn’t connect: ' + e.message); }
+  }, () => mpStatus('Can’t reach the code service. Try “manual codes”.'));
+  try { await Net.publish(code, 'j' + mp.guestId); } catch (e) { clearTimeout(timer); mpEnd('Couldn’t reach the code service (' + e.message + ')'); }
 }
 async function mpFindRom(hash) {
   if (curBytes && romHash === hash) return { name: romName, bytes: curBytes };
   try { for (const n of await romList()) { const r = await romGet(n); if (r && Net.fnv(r.data, 3) === hash) return { name: n, bytes: r.data }; } } catch {}
   return null;
 }
-async function mpMsg(m) {
-  switch (m.t) {
-    case 'hello': {
-      mp.mode = m.mode;
-      const r = await mpFindRom(m.rom);
-      if (!r) { mpSend({ t: 'err', msg: 'Your friend needs the same game' }); mpEnd(`You don’t have “${m.name}” (same ROM file needed)`); return; }
-      mp.pendingRom = r; mpSend({ t: 'ready' }); mpStatus('Game found. Waiting for host…'); break;
-    }
-    case 'err': mpEnd(m.msg); break;
-    case 'ready': mpStatus('Measuring connection…'); mpSend({ t: 'ping', n: 0, ts: performance.now() }); break;
-    case 'ping': mpSend({ t: 'pong', n: m.n, ts: m.ts }); break;
-    case 'pong': {
-      mp.rtts.push(performance.now() - m.ts);
-      if (mp.rtts.length < 6) { mpSend({ t: 'ping', n: mp.rtts.length, ts: performance.now() }); break; }
-      const r = mp.rtts.slice().sort((a, b) => a - b)[3];
-      mp.D = clamp(Math.ceil(r / 2 / 16.7) + 2, 3, 12);
-      mpSend({ t: 'start', mode: mp.mode, D: mp.D, rtt: r }); mpBegin(); break;
-    }
-    case 'start': mp.mode = m.mode; mp.D = m.D; mpBegin(); break;
-    case 'i':
-      if (mp.mode === 'race') { mp.oppIn[m.f] = m.m; mp.oppRecv = Math.max(mp.oppRecv, m.f + 1); }
-      else (mp.role === 'host' ? mp.guestIn : mp.hostIn)[m.f] = m.m;
-      break;
-    case 'h': mp.remote[m.f] = m.h; mpCheck(m.f); break;
-    case 'bye': mpEnd('Your friend disconnected'); break;
-  }
+
+/* ---- start / restart (host decides everything, including the input delay) ---- */
+async function pingPeer(peer) {
+  const out = [];
+  for (let i = 0; i < 6; i++) out.push(await new Promise(res => { peer._pr = res; peer.send({ t: 'ping', ts: performance.now() }); setTimeout(() => res(NaN), 1500); }));
+  const ok = out.filter(x => x === x).sort((a, b) => a - b); return ok.length ? ok[ok.length >> 1] : 100;
 }
-async function mpBegin() {
-  mp.frame = 0; mp.stall = 0; mp.desync = false; mp.mine = {}; mp.remote = {};
-  if (mp.mode !== 'race') { for (let i = 0; i < mp.D; i++) { mp.hostIn[i] = 0; mp.guestIn[i] = 0; } mp.queued = mp.D; }
-  const r = mp.role === 'host' ? { name: romName, bytes: curBytes } : mp.pendingRom;
+async function hostStart() {
+  if (mp.lobby.length < 2) return;
+  mp.mode = $('mpMode').value; mp.prio = $('mpPrio').value;
+  if (mp.mode === 'race' && !ghostSupported()) { toast('Race mode needs Super Mario Land (it draws the other players as ghosts). Pick a co-op mode for other games.'); return; }
+  $('mpStart').disabled = true; $('mpRestart').disabled = true; mpStatus('Measuring connections…');
+  const rtts = await Promise.all(mp.lobby.filter(p => p !== 0).map(p => pingPeer(mp.peers.get(p))));
+  const n = mp.lobby.length, srt = rtts.slice().sort((a, b) => b - a);
+  const owd = n === 2 ? srt[0] / 2 : (srt[0] + (srt[1] || 0)) / 2;   // worst client->host->client path
+  const low = mp.prio === 'delay', B = low ? 1 : 4, flushMs = (low || n === 2) ? 0 : 33;
+  const D = clamp(Math.ceil((owd + flushMs + 17) / 16.7) + B, 3, 24);
+  const msg = { t: 'start', mode: mp.mode, prio: mp.prio, players: mp.lobby.slice(), D, B, flushMs };
+  jsonClients(msg); mpBegin(msg);
+  $('mpStart').disabled = false; $('mpRestart').disabled = false;
+}
+async function mpBegin(m) {
+  mpStopTimers();
+  Object.assign(mp, { mode: m.mode, prio: m.prio, players: m.players.slice(), D: m.D, B: m.B, flushMs: m.flushMs, frame: 0, stall: 0, waiting: false, desync: false, checks: 0,
+    mine: {}, remote: {}, outbox: [], runs: [], inp: {}, inMax: {}, dropFrom: {}, role8: {}, ghosts: new Map(), lastPos: '', lastPose: '', sentTile: [], sendCount: 0, sinceSend: 0, hostPos: new Map() });
+  const split = SPLIT[Math.min(8, m.players.length)];
+  m.players.forEach((p, i) => { mp.role8[p] = m.mode === 'split' ? split[i] : 0xFF; });
+  if (lockstep()) for (const p of m.players) { mp.inp[p] = {}; for (let f = 0; f < mp.D; f++) mp.inp[p][f] = 0; mp.inMax[p] = mp.D; mp.dropFrom[p] = Infinity; }
+  mp.queued = mp.sentUpTo = mp.D;
   mp.active = false;
+  const r = isHost() ? { name: romName, bytes: curBytes } : mp.pendingRom;
   await startRom(r.name, r.bytes, { fresh: true });
-  camReset();
-  if (mp.mode === 'race') {
-    mp.opp = new GB(r.bytes); mp.opp.pal.set(PAL32); mp.oppImg = new ImageData(new Uint8ClampedArray(mp.opp.fb.buffer), 160, 144);
-    oppCtx.fillStyle = DMG[0]; oppCtx.fillRect(0, 0, 160, 144); updateOppBox();
+  camReset(); ff = false; $('ffSw').checked = false;
+  mp.active = true; mp.stage = 'active'; paused = false; kick();
+  if (isHost()) {
+    if (lockstep() && mp.flushMs > 0) mp.flushT = setInterval(flushOutbox, mp.flushMs);
+    if (!lockstep()) mp.posT = setInterval(hostPosTick, 100);
   }
-  ff = false; $('ffSw').checked = false;
-  mp.active = true; paused = false; kick();
-  mpStatus(`${MODE_NAMES[mp.mode]} · delay ${mp.mode === 'race' ? 0 : mp.D} frames`); mpUi();
-  toast(mp.mode === 'race' ? (ghostSupported() ? 'Race! Your friend is the ghost Mario.' : 'Race! Your friend’s screen is in the corner.')
-    : mp.role === 'host' ? (mp.mode === 'split' ? 'Co-op: you steer (D-pad), your friend jumps and runs (A/B).' : 'Co-op started.') : (mp.mode === 'split' ? 'Co-op: you have the buttons, your friend steers.' : 'Co-op started.'));
+  const mine = mp.role8[mp.pid];
+  mpStatus(`${mp.mode === 'race' ? 'Race' : mp.mode === 'split' ? 'Co-op (split controls)' : 'Co-op (shared controls)'} · ${m.players.length} players` + (lockstep() ? ` · input delay ${mp.D} frames` : ''));
+  mpUi();
+  toast(mp.mode === 'race' ? 'Race! The other players are ghost Marios in your world.' : mp.mode === 'split' ? `Co-op: you control ${roleText(mine)}.` : 'Co-op: everyone controls everything.');
 }
-function mpCheck(k) {
-  if (mp.mine[k] === undefined || mp.remote[k] === undefined) return;
-  mp.checks++;
-  if (mp.mine[k] !== mp.remote[k] && !mp.desync) { mp.desync = true; toast('The two games went out of sync. Disconnect and start again.'); }
-  delete mp.mine[k]; delete mp.remote[k];
+
+/* ---- lockstep co-op ---- */
+function pushMask(m) { const r = mp.runs, l = r[r.length - 1]; if (l && l[1] === m && l[0] < 255) l[0]++; else r.push([1, m]); }
+function flushLocal() {
+  if (!mp.runs.length) return;
+  const f0 = mp.sentUpTo, flat = []; let tot = 0;
+  for (const [len, m] of mp.runs) { flat.push(len, m); tot += len; }
+  mp.runs = []; mp.sentUpTo += tot;
+  if (isHost()) { mp.outbox.push({ pid: 0, f0, n: flat.length >> 1, flat }); if (mp.flushMs === 0) flushOutbox(); }
+  else toHost(new Uint8Array([0x10, ...u32(f0), flat.length >> 1, ...flat]));
 }
-// Local game advanced one frame; share/compare checksums every 120 frames.
-function mpHash(frameIdx, emu, mirrored) {
-  if ((frameIdx + 1) % 120) return;
-  const h = Net.fnv(emu.fb);
-  if (mirrored) { mp.mine[frameIdx] = h; mpCheck(frameIdx); } else mpSend({ t: 'h', f: frameIdx, h });
+function applyBatch(pid, f0, n, flat) {
+  const inp = mp.inp[pid]; if (!inp) return; let f = f0;
+  for (let i = 0; i < n; i++) { const len = flat[2 * i], m = flat[2 * i + 1]; for (let k = 0; k < len; k++) inp[f++] = m; }
+  mp.inMax[pid] = Math.max(mp.inMax[pid] || 0, f);
+}
+function flushOutbox() {
+  if (!mp.outbox.length) return;
+  for (const [cid, peer] of mp.peers) {
+    const bs = mp.outbox.filter(b => b.pid !== cid); if (!bs.length) continue;
+    const a = [0x11, bs.length]; for (const b of bs) a.push(b.pid, ...u32(b.f0), b.n, ...b.flat);
+    peer.sendBin(new Uint8Array(a));
+  }
+  mp.outbox = [];
+}
+function parseBatches(u, o, count, out) {
+  for (let i = 0; i < count; i++) { const pid = u[o++], f0 = r32(u, o); o += 4; const n = u[o++]; const flat = Array.from(u.subarray(o, o + 2 * n)); o += 2 * n; out.push({ pid, f0, n, flat }); }
 }
 function mpStep(mask) {
-  if (mp.mode === 'race') {
-    gb.setPad(mask); mpSend({ t: 'i', f: mp.frame, m: mask });
-    tuneAudio(); gb.runFrame(); camTrack(cam.me, gb); mpHash(mp.frame, gb, false); mp.frame++; return true;
-  }
-  const mine = mp.role === 'host' ? mp.hostIn : mp.guestIn;
-  while (mp.queued < mp.frame + mp.D) { mine[mp.queued] = mask; mpSend({ t: 'i', f: mp.queued, m: mask }); mp.queued++; }
-  const hm = mp.hostIn[mp.frame], gm = mp.guestIn[mp.frame];
-  if (hm === undefined || gm === undefined) {
-    if (++mp.stall === 40) { mp.waiting = true; $('hint').textContent = 'WAITING FOR PARTNER…'; }
+  if (!lockstep()) { tuneAudio(); gb.runFrame(); camTrack(cam.me, gb); mp.sinceSend++; return true; }
+  while (mp.queued < mp.frame + mp.D) { mp.inp[mp.pid][mp.queued] = mask; pushMask(mask); mp.queued++; if (mp.queued - mp.sentUpTo >= mp.B) flushLocal(); }
+  const f = mp.frame; let comb = 0, miss = null;
+  for (const p of mp.players) { const v = mp.inp[p][f]; if (v !== undefined) comb |= v & mp.role8[p]; else if (f < mp.dropFrom[p]) (miss || (miss = [])).push(p); }
+  if (miss) {
+    if (mp.stall === 0) flushLocal();                    // never sit on inputs the others may be waiting for
+    if (++mp.stall === 30) { mp.waiting = true; $('hint').textContent = 'WAITING FOR ' + miss.map(nameOf).join(', ').toUpperCase() + '…'; }
     return false;
   }
   if (mp.waiting) { mp.waiting = false; $('hint').textContent = ''; }
   mp.stall = 0;
-  gb.setPad(mp.mode === 'split' ? ((hm & 0x0F) | (gm & 0xF0)) : (hm | gm));
-  tuneAudio(); gb.runFrame();
-  delete mp.hostIn[mp.frame]; delete mp.guestIn[mp.frame];
-  mpHash(mp.frame, gb, false); mpHash(mp.frame, gb, true);
+  gb.setPad(comb); tuneAudio(); gb.runFrame();
+  for (const p of mp.players) delete mp.inp[p][f];
+  if ((f + 1) % 240 === 0) {
+    const h = Net.fnv(gb.fb);
+    if (isHost()) jsonClients({ t: 'h', f, h }); else { mp.mine[f] = h; mpCheck(f); }
+  }
   mp.frame++; return true;
 }
-// Race: replay the friend's inputs on a second emulator, a few frames behind to absorb network jitter.
-function mpOpp() {
-  if (!mp.opp) return;
-  const avail = mp.oppRecv - mp.oppFrame;
-  const k = avail > 60 ? 8 : avail > 30 ? 4 : avail > 6 ? 2 : avail >= 2 ? 1 : 0;
-  for (let i = 0; i < k; i++) {
-    mp.opp.setPad(mp.oppIn[mp.oppFrame] | 0); mp.opp.runFrame(); camTrack(cam.opp, mp.opp);
-    mpHash(mp.oppFrame, mp.opp, true);
-    mp.oppIn[mp.oppFrame] = undefined; mp.oppFrame++;
-  }
-  if (k && !$('oppbox').hidden) oppCtx.putImageData(mp.oppImg, 0, 0);
+function mpCheck(k) {
+  if (mp.mine[k] === undefined || mp.remote[k] === undefined) return;
+  mp.checks++;
+  if (mp.mine[k] !== mp.remote[k] && !mp.desync) { mp.desync = true; toast('The games went out of sync. Ask the host to press Restart.'); if (mp.guestPeer) mp.guestPeer.send({ t: 'ds' }); }
+  delete mp.mine[k]; delete mp.remote[k];
 }
 
-/* ---- ghost: your friend's Mario drawn into your world (Super Mario Land)
-   Camera position = the background scroll register as used for the playfield (scanline 100), unwrapped across its 256 wrap-arounds. A sprite's
-   world X is camera + screen X, so a friend sprite shows up at (friendCamera - myCamera + its screen X).
-   Mario is OAM slots 3..6 (small) or up to 10 (big). Shown only when both are in the same level (read from
-   the world/level digits on the HUD). Drawn dithered after the checksum, so it never affects sync. */
-const cam = { me: { prev: -1, abs: 0 }, opp: { prev: -1, abs: 0 } };
-function camReset() { cam.me.prev = cam.opp.prev = -1; }
+/* ---- ghosts (race) ----
+   Camera = the background scroll register as used for the playfield (scanline 100), unwrapped across its 256
+   wrap-arounds. A sprite's world X is camera + screen X. Mario is OAM slots 3..6 (small) up to 10 (big).
+   World/level are read from the HUD digits. We send: POS {level, world X, Y, visible} (changes only, <= 10/s),
+   POSE {sprites relative to Mario: dx, dy, tile, flags} (changes only) and TILE {16 bytes} the first time a tile
+   is used. Receivers draw the sprites dithered (a different pattern per player) with a small player number. */
+const cam = { me: { prev: -1, abs: 0 } };
+function camReset() { cam.me.prev = -1; }
 function camTrack(c, emu) {
   const cur = emu.scxLine[100];
   if (c.prev < 0) c.abs = cur;
@@ -586,86 +731,141 @@ function camTrack(c, emu) {
   c.prev = cur;
 }
 const ghostSupported = () => !!gb && /MARIOLAND/i.test(gb.title.replace(/\s+/g, ''));
-const levelOf = e => (e.vram[0x182C] << 8) | e.vram[0x182E];
-function mpGhost() {
-  if (mp.mode !== 'race' || !mp.opp || !ghostOn || !ghostSupported()) return;
-  const o = mp.opp, m = gb;
-  if (levelOf(o) !== levelOf(m) || !m.oam[12] || !o.oam[12]) return;
-  const dx = cam.opp.abs - cam.me.abs, ox = o.oam[13], oy = o.oam[12];
-  for (let i = 3; i <= 10; i++) {
-    const y = o.oam[i * 4], x = o.oam[i * 4 + 1];
-    if (!y || y >= 160 || x - ox > 12 || x - ox < -4 || y - oy < -4 || y - oy > 40) continue;
-    o.drawGhostSprite(i, m.fb, dx, PAL32);
+const lvl8 = e => ((e.vram[0x182C] & 15) << 4) | (e.vram[0x182E] & 15);
+function ghostCapture() {
+  const o = gb.oam, y3 = o[12], x3 = o[13];
+  const vis = ghostSupported() && y3 > 0 && y3 < 160 && x3 > 0 && x3 < 168;
+  const lv = lvl8(gb), x = (cam.me.abs + x3) & 0xFFFF, y = y3;
+  const spr = [];
+  if (vis) for (let i = 3; i <= 10; i++) {
+    const yi = o[i * 4], xi = o[i * 4 + 1];
+    if (!yi || yi >= 160 || xi - x3 > 12 || xi - x3 < -4 || yi - y3 < -4 || yi - y3 > 40) continue;
+    spr.push((xi - x3) & 255, (yi - y3) & 255, o[i * 4 + 2], o[i * 4 + 3]);
+  }
+  const posKey = `${vis}|${lv}|${x}|${y}`, now = performance.now();
+  if (posKey !== mp.lastPos || now - mp.lastSend > 1000) {
+    mp.lastPos = posKey; mp.lastSend = now;
+    if (isHost()) { mp.hostPos.set(0, { lv, x, y, fl: vis ? 1 : 0, dirty: true }); }
+    else toHost(new Uint8Array([0x20, lv, x & 255, x >> 8, y, vis ? 1 : 0]));
+  }
+  const poseKey = spr.join(',');
+  if (vis && poseKey !== mp.lastPose) {
+    mp.lastPose = poseKey;
+    for (let k = 0; k < spr.length; k += 4) {                       // send any tile graphics the others haven't seen yet
+      const id = spr[k + 2], bytes = gb.vram.subarray(id * 16, id * 16 + 16), h = Net.fnv(bytes);
+      if (mp.sentTile[id] !== h) { mp.sentTile[id] = h; relayOwn(0x24, [id, ...bytes]); }
+    }
+    relayOwn(0x22, [spr.length >> 2, ...spr]);
   }
 }
-function updateOppBox() { $('oppbox').hidden = !(mp.opp && (oppWin || !ghostSupported() || !ghostOn)); mpLayout(); }
-function mpLayout(dpr = window.devicePixelRatio || 1) {
-  // Use the empty margin beside the LCD when it's wide enough (no overlap); otherwise a small corner overlay.
-  const margin = (window.innerWidth - 160 * kdev / dpr) / 2 - 20;
-  let k = Math.floor(margin * dpr / 160); if (k < 2) k = Math.max(1, Math.round(kdev * 0.4));
-  const s = k / dpr;
-  oppCanvas.style.width = 160 * s + 'px'; oppCanvas.style.height = 144 * s + 'px';
+// Own POSE/TILE: guests send type 0x22/0x24 to the host; the host broadcasts as 0x23/0x25 with pid 0.
+function relayOwn(type, payload) {
+  if (isHost()) toClients(new Uint8Array([type + 1, 0, ...payload]));
+  else toHost(new Uint8Array([type, ...payload]));
+}
+function ghostOf(pid) { let g = mp.ghosts.get(pid); if (!g) { g = { init: false, cx: 0, cy: 0, tx: 0, ty: 0, t0: 0, lv: 0, vis: false, last: 0, spr: [], tiles: [] }; mp.ghosts.set(pid, g); } return g; }
+function applyPos(pid, lv, x, y, fl) {
+  const g = ghostOf(pid), now = performance.now();
+  if (!g.init || g.lv !== lv || Math.abs(x - g.tx) > 90) { g.cx = x; g.cy = y; }
+  else { const a = clamp((now - g.t0) / GHOST_MS, 0, 1); g.cx = g.cx + (g.tx - g.cx) * a; g.cy = g.cy + (g.ty - g.cy) * a; }
+  g.tx = x; g.ty = y; g.t0 = now; g.lv = lv; g.vis = !!(fl & 1); g.last = now; g.init = true;
+}
+function applyGhostBin(pid, type, u, o) {          // type is the relayed form: 0x23 POSE, 0x25 TILE
+  const g = ghostOf(pid);
+  if (type === 0x23) { const n = u[o++]; g.spr = []; for (let i = 0; i < n; i++, o += 4) g.spr.push([(u[o] << 24) >> 24, (u[o + 1] << 24) >> 24, u[o + 2], u[o + 3]]); }
+  else if (type === 0x25) g.tiles[u[o]] = u.slice(o + 1, o + 17);
+}
+function hostBin(pid, u) {
+  switch (u[0]) {
+    case 0x10: { const f0 = r32(u, 1), n = u[5], flat = Array.from(u.subarray(6, 6 + 2 * n)); applyBatch(pid, f0, n, flat); mp.outbox.push({ pid, f0, n, flat }); if (mp.flushMs === 0) flushOutbox(); break; }
+    case 0x20: { const lv = u[1], x = r16(u, 2), y = u[4], fl = u[5]; mp.hostPos.set(pid, { lv, x, y, fl, dirty: true }); applyPos(pid, lv, x, y, fl); break; }
+    case 0x22: case 0x24: { const rel = new Uint8Array(u.length + 1); rel[0] = u[0] + 1; rel[1] = pid; rel.set(u.subarray(1), 2); toClients(rel, pid); applyGhostBin(pid, u[0] + 1, rel, 2); break; }
+  }
+}
+function guestBin(u) {
+  switch (u[0]) {
+    case 0x11: { const out = []; parseBatches(u, 2, u[1], out); for (const b of out) if (b.pid !== mp.pid) applyBatch(b.pid, b.f0, b.n, b.flat); break; }
+    case 0x21: for (let i = 0, o = 2; i < u[1]; i++, o += 6) { const pid = u[o]; if (pid !== mp.pid) applyPos(pid, u[o + 1], r16(u, o + 2), u[o + 4], u[o + 5]); } break;
+    case 0x23: case 0x25: if (u[1] !== mp.pid) applyGhostBin(u[1], u[0], u, 2); break;
+  }
+}
+function hostPosTick() {
+  const d = []; for (const [pid, s] of mp.hostPos) if (s.dirty) { s.dirty = false; d.push(pid, s.lv, s.x & 255, s.x >> 8, s.y, s.fl); }
+  if (d.length) toClients(new Uint8Array([0x21, d.length / 6, ...d]));
+}
+const DIGITS = { 1: '010110010010111', 2: '111001111100111', 3: '111001111001111', 4: '101101111001001', 5: '111100111001111', 6: '111100111101111', 7: '111001010010010', 8: '111101111101111' };
+const keepPx = (pat, x, y) => pat === 0 ? ((x + y) & 1) === 0 : pat === 1 ? ((x + y) & 1) === 1 : pat === 2 ? (y & 1) === 0 : pat === 3 ? (x & 1) === 0 : ((x + y) % 3) !== 0;
+function mpGhost() {
+  if (mp.mode !== 'race' || !ghostOn) return;
+  const dst = gb.fb, now = performance.now(), mylv = lvl8(gb);
+  for (const [pid, g] of mp.ghosts) {
+    if (!g.vis || g.lv !== mylv || now - g.last > GHOST_STALE || !g.spr.length) continue;
+    const a = clamp((now - g.t0) / GHOST_MS, 0, 1), wx = g.cx + (g.tx - g.cx) * a, wy = g.cy + (g.ty - g.cy) * a;
+    const sx = Math.round(wx - cam.me.abs), sy = Math.round(wy), pat = pid % 5;
+    for (const [dx, dy, tile, fl] of g.spr) {
+      const t = g.tiles[tile]; if (!t) continue;
+      const px = sx + dx - 8, py = sy + dy - 16, pv = (fl & 0x10) ? gb.obp1 : gb.obp0;
+      for (let r = 0; r < 8; r++) {
+        const y = py + r; if (y < 0 || y >= 144) continue;
+        const row = (fl & 0x40) ? 7 - r : r, lo = t[row * 2], hi = t[row * 2 + 1];
+        for (let p = 0; p < 8; p++) {
+          const x = px + p; if (x < 0 || x >= 160 || !keepPx(pat, x, y)) continue;
+          const b = (fl & 0x20) ? p : 7 - p, ci = ((lo >> b) & 1) | (((hi >> b) & 1) << 1);
+          if (ci) dst[y * 160 + x] = PAL32[(pv >> (ci * 2)) & 3];
+        }
+      }
+    }
+    // player number above the head
+    const d = DIGITS[pid + 1]; if (d) for (let i = 0; i < 15; i++) if (d[i] === '1') { const x = sx - 4 + (i % 3), y = sy - 22 + ((i / 3) | 0); if (x >= 0 && x < 160 && y >= 0 && y < 144) dst[y * 160 + x] = PAL32[3]; }
+  }
 }
 
-// --- connect UI (6-character code via relay; manual long codes as a fallback)
+/* ---- connect UI ---- */
+const fmtCode = c => c.slice(0, 3) + ' ' + c.slice(3);
 async function copyText(t, btn) {
   try { await navigator.clipboard.writeText(t); } catch { const o = $('mpOut'); o.select(); document.execCommand('copy'); }
   if (btn) { const w = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = w, 1200); }
 }
-const fmtCode = c => c.slice(0, 3) + ' ' + c.slice(3);
-$('mpHost').onclick = async () => {
-  if (!gb) { toast('Load a game first'); return; }
-  mp.role = 'host'; mp.mode = $('mpMode').value; mpNew(); mp.stage = 'host';
-  const code = Net.newCode(); $('mpCode').textContent = fmtCode(code); mp.code = code;
-  mpStatus('Creating code…'); mpUi();
-  try {
-    const offer = await mp.peer.host();
-    mp.sub = Net.subscribe(code, msg => { if (msg[0] === 'a' && mp.peer && !mp.peer.open) { mpClean(); mp.peer.accept(msg.slice(1)).catch(e => mpStatus('Connect failed: ' + e.message)); mpStatus('Friend found, connecting…'); } },
-      () => mpStatus('Reconnecting to the code service…'));
-    await Net.publish(code, 'o' + offer);
-    mpStatus('Waiting for your friend. They enter the code on their device.');
-  } catch (e) { mpEnd('Couldn’t reach the code service (' + e.message + '). Try “manual codes” below.'); }
-};
-$('mpJoin').onclick = () => { mp.role = 'guest'; mpNew(); mp.stage = 'join'; $('mpCodeIn').value = ''; mpStatus('Enter the host’s 6-character code'); mpUi(); setTimeout(() => $('mpCodeIn').focus(), 50); };
-$('mpGo').onclick = async () => {
-  const code = Net.normCode($('mpCodeIn').value); if (code.length !== 6 || !mp.peer) { mpStatus('The code has 6 characters, e.g. K7Q X2M'); return; }
-  mpStatus('Looking for the host…'); let got = false;
-  const timer = setTimeout(() => { if (!got) { mpClean(); mpStatus('No game found for that code. Check the code and that the host is waiting.'); } }, 20000);
-  mp.sub = Net.subscribe(code, async msg => {
-    if (msg[0] !== 'o' || got) return; got = true; clearTimeout(timer); mpClean();
-    try { mpStatus('Connecting…'); const ans = await mp.peer.join(msg.slice(1)); await Net.publish(code, 'a' + ans); }
-    catch (e) { mpEnd('Couldn’t connect: ' + e.message); }
-  }, () => mpStatus('Can’t reach the code service. Try “manual codes” below.'));
+$('mpHost').onclick = hostOpenLobby;
+$('mpJoin').onclick = () => { mp.role = 'guest'; mp.stage = 'join'; $('mpCodeIn').value = ''; mpStatus('Enter the host’s 6-character code'); mpUi(); setTimeout(() => $('mpCodeIn').focus(), 50); };
+$('mpGo').onclick = () => {
+  const code = Net.normCode($('mpCodeIn').value); if (code.length !== 6) { mpStatus('The code has 6 characters, e.g. K7Q X2M'); return; }
+  guestJoin(code);
 };
 $('mpCodeIn').addEventListener('input', e => { const v = Net.normCode(e.target.value).slice(0, 6); e.target.value = v.length > 3 ? fmtCode(v) : v; });
 $('mpCopyCode').onclick = e => copyText(mp.code || '', e.target);
 if (navigator.share) $('mpShareCode').onclick = () => navigator.share({ text: `Join my Game Boy game: code ${fmtCode(mp.code || '')}` }).catch(() => {}); else $('mpShareCode').hidden = true;
-// manual fallback (no relay): swap two long codes over any chat app
-$('mpHostM').onclick = async () => {
-  if (!gb) { toast('Load a game first'); return; }
-  mp.role = 'host'; mp.mode = $('mpMode').value; mpNew(); mp.stage = 'mhost';
-  $('mpOut').value = ''; $('mpIn').value = ''; $('mpOutLbl').textContent = 'Step 1: send this code to your friend'; $('mpInLbl').textContent = 'Step 2: paste your friend’s reply code';
-  mpStatus('Creating code…'); mpUi();
-  try { $('mpOut').value = await mp.peer.host(); mpStatus('Waiting for your friend’s reply code'); } catch (e) { mpEnd('Could not create code: ' + e.message); }
+$('mpStart').onclick = hostStart;
+$('mpRestart').onclick = hostStart;
+$('mpStop').onclick = () => mpEnd(isHost() ? 'Lobby closed' : 'You left');
+// manual fallback (no code service): swap two long codes over any chat app
+let manualPeer = null, manualId = '';
+$('mpAddM').onclick = async () => {
+  if (mp.peers.size + mp.pending.size >= MAXP - 1) { toast('Lobby is full'); return; }
+  mp.manual = 'add'; manualId = 'm' + Math.random().toString(36).slice(2, 5); manualPeer = hostMakePeer(manualId); mp.pending.set(manualId, manualPeer);
+  $('mpOut').value = ''; $('mpIn').value = ''; $('mpOutLbl').textContent = 'Step 1: send this code to your friend'; $('mpInLbl').textContent = 'Step 2: paste their reply code';
+  $('mpPanel').hidden = false; mpStatus('Creating code…');
+  try { $('mpOut').value = await manualPeer.host(); mpStatus('Waiting for your friend’s reply code'); } catch (e) { mpStatus('Could not create code: ' + e.message); }
 };
-$('mpJoinM').onclick = () => { mp.role = 'guest'; mpNew(); mp.stage = 'mjoin'; $('mpOut').value = ''; $('mpIn').value = '';
-  $('mpOutLbl').textContent = 'Step 2: send this reply code back to the host'; $('mpInLbl').textContent = 'Step 1: paste the host’s code'; mpStatus('Paste the host’s code'); mpUi(); };
+$('mpJoinM').onclick = () => { mp.role = 'guest'; mp.stage = 'join'; mp.manual = 'join'; mp.guestPeer = new Net.Peer(guestHandlers());
+  $('mpOut').value = ''; $('mpIn').value = ''; $('mpOutLbl').textContent = 'Step 2: send this reply code back to the host'; $('mpInLbl').textContent = 'Step 1: paste the host’s code';
+  $('mpJoinBox').hidden = true; mpStatus('Paste the host’s code'); mpUi(); $('mpPanel').hidden = false; };
 $('mpGoM').onclick = async () => {
-  const code = $('mpIn').value.trim(); if (!code || !mp.peer) return;
+  const code = $('mpIn').value.trim(); if (!code) return;
   try {
-    if (mp.stage === 'mjoin') { mpStatus('Creating reply…'); $('mpOut').value = await mp.peer.join(code); mpStatus('Send your reply code to the host'); }
-    else { mpStatus('Connecting…'); await mp.peer.accept(code); }
+    if (mp.manual === 'join') { mpStatus('Creating reply…'); $('mpOut').value = await mp.guestPeer.join(code); mpStatus('Send your reply code to the host'); }
+    else if (manualPeer) { mpStatus('Connecting…'); await manualPeer.accept(code); $('mpPanel').hidden = true; mp.manual = ''; }
   } catch (e) { mpStatus('That code didn’t work: ' + e.message); }
 };
 $('mpPaste').onclick = async () => { try { $('mpIn').value = await navigator.clipboard.readText(); } catch { $('mpIn').focus(); toast('Long-press the box and choose Paste'); } };
 $('mpCopy').onclick = e => copyText($('mpOut').value, e.target);
 if (navigator.share) $('mpShare').onclick = () => navigator.share({ text: $('mpOut').value }).catch(() => {}); else $('mpShare').hidden = true;
-$('mpStop').onclick = () => mpEnd('Disconnected');
 
 /* ---------------------------------------------------------- menu */
 function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = 'none', 4500); }
 function openMenu() {
   $('menu').classList.add('open'); paused = true; releaseAllInputs(); if (gb) flushSave(); refreshLibrary(); updateSnd();
+  if (mp.active && lockstep()) flushLocal();   // let the others run ahead on the inputs we already have
   audioSleep(mp.active ? 60000 : 4000);
 }
 function closeMenu() { $('menu').classList.remove('open'); paused = false; if (gb) gb.apu.flush(); audioWake(); kick(); }
@@ -717,8 +917,7 @@ bindSwitch('clickSw', () => clickFb, v => { clickFb = v; store.set('click', v); 
 bindSwitch('fxSw', () => lcdFx, v => { lcdFx = v; store.set('fx', v); $('lcdbox').classList.toggle('plain', !v); glassDirty = true; });
 bindSwitch('fpsSw', () => showFps, v => { showFps = v; store.set('fps', v); $('fps').style.display = v ? 'block' : 'none'; });
 bindSwitch('ffSw', () => ff, v => { ff = v; glassDirty = true; });
-bindSwitch('ghostSw', () => ghostOn, v => { ghostOn = v; store.set('ghost', v); updateOppBox(); });
-bindSwitch('winSw', () => oppWin, v => { oppWin = v; store.set('oppwin', v); updateOppBox(); });
+bindSwitch('ghostSw', () => ghostOn, v => { ghostOn = v; store.set('ghost', v); });
 $('lcdbox').classList.toggle('plain', !lcdFx); $('fps').style.display = showFps ? 'block' : 'none';
 $('resetBtn').onclick = () => { if (gb) { flushSave(); const rn = romName; romGet(rn).then(r => r && startRom(rn, r.data)); } };
 
@@ -726,7 +925,7 @@ $('resetBtn').onclick = () => { if (gb) { flushSave(); const rn = romName; romGe
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
 
 mpUi(); layout();
-window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask });
+window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask, ghosts: mp.ghosts });
 
 // Resume the last game (after a tap, so audio and fullscreen are allowed to start), otherwise show the menu.
 (async () => {

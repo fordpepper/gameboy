@@ -39,13 +39,17 @@ class Peer {
     });
   }
   _setup(dc) {
-    this.dc = dc;
+    this.dc = dc; dc.binaryType = 'arraybuffer';
     dc.onopen = () => this.h.open && this.h.open();
     dc.onclose = () => this.h.close && this.h.close('closed');
-    dc.onmessage = e => { try { this.h.msg(JSON.parse(e.data)); } catch {} };
+    dc.onmessage = e => {
+      const d = e.data;
+      if (typeof d === 'string') { try { this.h.msg && this.h.msg(JSON.parse(d)); } catch {} }
+      else if (this.h.bin) this.h.bin(new Uint8Array(d));
+    };
   }
   async host() {
-    this._setup(this.pc.createDataChannel('gb', { ordered: true }));
+    this._setup(this.pc.createDataChannel('gb', { ordered: false })); // reliable but unordered: lower latency under loss
     await this.pc.setLocalDescription(await this.pc.createOffer());
     await this._gathered();
     return encode(this.pc.localDescription.toJSON());
@@ -59,6 +63,7 @@ class Peer {
   }
   async accept(code) { await this.pc.setRemoteDescription(await decode(code)); }
   send(o) { if (this.dc && this.dc.readyState === 'open') this.dc.send(JSON.stringify(o)); }
+  sendBin(u8) { if (this.dc && this.dc.readyState === 'open') this.dc.send(u8); }
   get open() { return !!this.dc && this.dc.readyState === 'open'; }
   close() { try { this.dc && this.dc.close(); } catch {} try { this.pc.close(); } catch {} }
 }

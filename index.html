@@ -134,11 +134,11 @@
   .row.col .row { margin: 0; } .row.col .row button { flex: 1; }
   textarea { width: 100%; background: #14161b; color: var(--ink); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; font: 12px ui-monospace, Menlo, monospace; resize: none; user-select: text; -webkit-user-select: text; }
   select { font: inherit; color: var(--ink); background: #2d313b; border: 0; border-radius: 12px; padding: 11px 12px; max-width: 48%; }
-  #oppbox { position: absolute; z-index: 3; left: calc(env(safe-area-inset-left) + 12px); top: calc(env(safe-area-inset-top) + 12px); line-height: 0; pointer-events: none;
-    border-radius: 3px; overflow: hidden; box-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 8px 24px rgba(0,0,0,.5); opacity: .95; }
-  #oppbox[hidden] { display: none; }
-  #opp { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
-  #oppbox span { position: absolute; left: 4px; top: 3px; font: 700 10px/1 -apple-system, system-ui, sans-serif; letter-spacing: .1em; color: #fff; background: rgba(0,0,0,.45); padding: 3px 5px; border-radius: 4px; }
+  #mpPlayers { display: flex; flex-direction: column; gap: 6px; }
+  .prow { display: flex; align-items: center; gap: 10px; background: #14161b; border-radius: 12px; padding: 8px 12px; }
+  .prow i { font-style: normal; font-weight: 700; width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #12160a; display: grid; place-items: center; font-size: 14px; flex: none; }
+  .prow small { margin-left: auto; color: var(--dim); font-size: 12px; text-align: right; }
+  .rb.off, .sm.off { opacity: .3; } #dpad [data-d].off::after { opacity: .12; }
   .tip { color: var(--dim); font-size: 13px; line-height: 1.5; padding: 4px 4px 0; }
   #toast { position: absolute; z-index: 20; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 24px); transform: translateX(-50%); max-width: 90%; text-align: center;
     background: rgba(20,22,28,.95); border: 1px solid var(--line); padding: 10px 16px; border-radius: 14px; display: none; font-size: 14px; }
@@ -165,7 +165,6 @@
     </div>
     <div class="sm" id="start" data-b="7">START</div>
   </div>
-  <div id="oppbox" hidden><canvas id="opp" width="160" height="144"></canvas><span>FRIEND</span></div>
   <div id="fps"></div>
   <div id="topbtns">
     <button class="ico" id="sndBtn" aria-label="Sound"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path id="sndWaves" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg></button>
@@ -203,27 +202,31 @@
 
     <h3>Multiplayer</h3>
     <div class="card">
-      <div class="row"><div class="lbl">Play online with a friend<small id="mpStatus">Not connected</small></div><button id="mpStop" hidden>Disconnect</button></div>
-      <div class="row" id="mpModeRow"><div class="lbl">Mode<small>Race: each plays their own game (friend shows as a ghost). Co-op: you share one Mario.</small></div>
-        <select id="mpMode"><option value="race">Race</option><option value="split">Co-op: split controls</option><option value="shared">Co-op: shared controls</option></select></div>
+      <div class="row"><div class="lbl">Play online with friends (up to 8)<small id="mpStatus">Not connected</small></div><button id="mpStop" hidden>Leave</button></div>
       <div class="row" id="mpBtns"><button id="mpHost" class="primary">Host a game</button><button id="mpJoin">Join with code</button></div>
-      <div class="row col" id="mpHostBox" hidden><div class="lbl">Your code<small>Tell your friend this code. They tap “Join with code”.</small></div>
+      <div class="row col" id="mpHostBox" hidden><div class="lbl">Lobby code<small>Friends tap “Join with code” and enter this.</small></div>
         <div id="mpCode">––– –––</div>
         <div class="row"><button id="mpCopyCode">Copy</button><button id="mpShareCode">Share…</button></div></div>
-      <div class="row col" id="mpJoinBox" hidden><div class="lbl">Friend’s code</div>
+      <div class="row col" id="mpJoinBox" hidden><div class="lbl">Host’s code</div>
         <input id="mpCodeIn" maxlength="7" inputmode="text" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="K7Q X2M">
         <div class="row"><button id="mpGo" class="primary">Connect</button></div></div>
+      <div class="row col" id="mpLobby" hidden><div class="lbl">Players</div><div id="mpPlayers"></div></div>
+      <div class="row col" id="mpOptsRow" hidden>
+        <div class="row"><div class="lbl">Mode<small>Race: everyone plays their own game and sees the others as ghosts (Super Mario Land). Co-op: everyone steers one Mario together.</small></div>
+          <select id="mpMode"><option value="race">Race (ghosts)</option><option value="split">Co-op: split controls</option><option value="shared">Co-op: shared controls</option></select></div>
+        <div class="row"><div class="lbl">Priority<small>Low data sends fewer, bigger messages. Low delay sends every frame (co-op only).</small></div>
+          <select id="mpPrio"><option value="data">Low data</option><option value="delay">Low delay</option></select></div></div>
+      <div class="row" id="mpStartRow" hidden><button id="mpStart" class="primary" disabled>Start</button><button id="mpRestart" hidden>Restart together</button></div>
+      <div class="row" id="mpGhostRow" hidden><div class="lbl">Show other players as ghosts</div><label class="sw"><input type="checkbox" id="ghostSw"><span></span></label></div>
+      <div class="row col" id="mpManual"><div class="lbl"><small>Can’t connect with a code? Use long manual codes instead (no code service needed):</small></div>
+        <div class="row"><button id="mpAddM">Add a player manually</button><button id="mpJoinM">Join manually</button></div></div>
       <div class="row col" id="mpPanel" hidden>
         <div class="lbl" id="mpOutLbl">Your code</div><textarea id="mpOut" readonly rows="3" placeholder="…"></textarea>
         <div class="row"><button id="mpCopy">Copy</button><button id="mpShare">Share…</button></div>
         <div class="lbl" id="mpInLbl">Friend’s code</div><textarea id="mpIn" rows="3" placeholder="Paste here"></textarea>
         <div class="row"><button id="mpPaste">Paste</button><button id="mpGoM" class="primary">Connect</button></div></div>
-      <div class="row" id="mpGhostRow" hidden><div class="lbl">Show friend as a ghost<small>Super Mario Land: their Mario appears in your level</small></div><label class="sw"><input type="checkbox" id="ghostSw"><span></span></label></div>
-      <div class="row" id="mpWinRow" hidden><div class="lbl">Show friend’s screen window</div><label class="sw"><input type="checkbox" id="winSw"><span></span></label></div>
-      <div class="row col" id="mpManual"><div class="lbl"><small>Can’t connect with a code? Use long manual codes instead (no code service needed):</small></div>
-        <div class="row"><button id="mpHostM">Manual host</button><button id="mpJoinM">Manual join</button></div></div>
     </div>
-    <div class="tip">Both of you need the same ROM file in the app. Super Mario Land is single-player, so this runs the game in sync on both devices. The game connection is direct between the two devices; the 6-character code is exchanged through the free ntfy.sh service, which only sees the random code and connection details.</div>
+    <div class="tip">Everyone needs the same ROM file in the app. The game traffic is direct between devices (a few hundred bytes a second per player). The 6-character code is exchanged through the free ntfy.sh service, which only sees the random code and connection details.</div>
 
     <h3>Game</h3>
     <div class="card">
@@ -232,7 +235,7 @@
     </div>
 
     <h3>Tips</h3>
-    <div class="tip">Landscape is the most comfortable. Touches anywhere in a side column work, so you don’t have to hit the pad exactly. Plug in or pair a controller (or use a keyboard) and the screen grows to full size; touch the screen to bring the buttons back. Keyboard: arrows, X = A, Z = B, Enter = Start, Shift = Select.</div>
+    <div class="tip">Landscape is the most comfortable. Touches anywhere in a side column work, so you don’t have to hit the pad exactly. Plug in or pair a controller (or use a keyboard) and the screen grows to full size; touch the screen to bring the buttons back. Keyboard: arrows, X = A, Z = B, Enter = Start, Shift = Select; Esc or M opens this menu.</div>
   </div>
 </div>
 <div id="toast"></div>

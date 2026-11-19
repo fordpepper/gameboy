@@ -11,4 +11,10 @@ Bring your own ROMs (load them from the in-app menu; they are stored only in you
 
 ## Multiplayer
 
-Menu → Multiplayer: host/join over a direct WebRTC connection using a 6-character code (exchanged via ntfy.sh; manual long codes also available). Modes: Race (see your friend's game in a corner window), Co-op split controls, Co-op shared controls. Both players need the same ROM. The emulator is deterministic, so only inputs are exchanged; checksums detect desyncs.
+Menu → Multiplayer. One host, up to 7 friends, joined with a 6-character code (relayed through ntfy.sh; manual long codes also work). Everyone connects directly to the host over WebRTC.
+
+- **Race** (Super Mario Land): everyone plays their own game; the others appear as numbered ghost Marios in your world. Only Mario's position/pose is shared (a few hundred bytes per second), nothing is simulated for other players, and pausing can't desync anything.
+- **Co-op**: everyone controls one Mario in lockstep. Split controls hand each player a share of the buttons (up to one button each at 8 players); shared lets everyone press everything. A paused player pauses the game for everybody.
+- Priority: *Low data* batches inputs (default); *Low delay* sends every frame.
+
+Everyone needs the same ROM file in the app.
