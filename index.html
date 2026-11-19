@@ -43,7 +43,10 @@
   /* shadow cast onto the glass by the bezel, as on the real LCD */
   #lcdfx { position: absolute; inset: 0; pointer-events: none;
     box-shadow: inset calc(var(--s) * .55) calc(var(--s) * .8) calc(var(--s) * 1.1) rgba(0,0,0,.42), inset calc(var(--s) * -.15) calc(var(--s) * -.2) calc(var(--s) * .4) rgba(0,0,0,.18); }
+  #lcdfx { background-size: var(--s) var(--s); background-repeat: repeat; image-rendering: pixelated; }
   #lcdbox.plain #lcdfx { display: none; }
+  #mpCode { font: 700 34px ui-monospace, Menlo, monospace; letter-spacing: .12em; text-align: center; padding: 12px 0; background: #14161b; border-radius: 12px; user-select: text; -webkit-user-select: text; }
+  input[type=text], #mpCodeIn { width: 100%; font: 700 28px ui-monospace, Menlo, monospace; letter-spacing: .12em; text-align: center; text-transform: uppercase; color: var(--ink); background: #14161b; border: 1px solid var(--line); border-radius: 12px; padding: 12px; user-select: text; -webkit-user-select: text; }
   #hint { position: absolute; pointer-events: none; color: #1f2c18; font: 700 calc(var(--s) * 5) ui-monospace, Menlo, monospace; text-align: center; letter-spacing: .04em; opacity: .85; }
   #fps { position: absolute; left: 50%; transform: translateX(-50%); top: calc(env(safe-area-inset-top) + 10px); font: 12px ui-monospace, monospace; color: var(--accent); display: none; z-index: 4; text-shadow: 0 1px 2px #000; }
 
@@ -201,17 +204,26 @@
     <h3>Multiplayer</h3>
     <div class="card">
       <div class="row"><div class="lbl">Play online with a friend<small id="mpStatus">Not connected</small></div><button id="mpStop" hidden>Disconnect</button></div>
-      <div class="row" id="mpModeRow"><div class="lbl">Mode<small>Race: each plays their own game. Co-op: you share one Mario.</small></div>
+      <div class="row" id="mpModeRow"><div class="lbl">Mode<small>Race: each plays their own game (friend shows as a ghost). Co-op: you share one Mario.</small></div>
         <select id="mpMode"><option value="race">Race</option><option value="split">Co-op: split controls</option><option value="shared">Co-op: shared controls</option></select></div>
-      <div class="row"><button id="mpHost" class="primary">Host a game</button><button id="mpJoin">Join a game</button></div>
-      <div id="mpPanel" hidden>
-        <div class="row col"><div class="lbl" id="mpOutLbl">Your code</div><textarea id="mpOut" readonly rows="3" placeholder="…"></textarea>
-          <div class="row"><button id="mpCopy">Copy</button><button id="mpShare">Share…</button></div></div>
-        <div class="row col"><div class="lbl" id="mpInLbl">Friend’s code</div><textarea id="mpIn" rows="3" placeholder="Paste here"></textarea>
-          <div class="row"><button id="mpPaste">Paste</button><button id="mpGo" class="primary">Connect</button></div></div>
-      </div>
+      <div class="row" id="mpBtns"><button id="mpHost" class="primary">Host a game</button><button id="mpJoin">Join with code</button></div>
+      <div class="row col" id="mpHostBox" hidden><div class="lbl">Your code<small>Tell your friend this code. They tap “Join with code”.</small></div>
+        <div id="mpCode">––– –––</div>
+        <div class="row"><button id="mpCopyCode">Copy</button><button id="mpShareCode">Share…</button></div></div>
+      <div class="row col" id="mpJoinBox" hidden><div class="lbl">Friend’s code</div>
+        <input id="mpCodeIn" maxlength="7" inputmode="text" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="K7Q X2M">
+        <div class="row"><button id="mpGo" class="primary">Connect</button></div></div>
+      <div class="row col" id="mpPanel" hidden>
+        <div class="lbl" id="mpOutLbl">Your code</div><textarea id="mpOut" readonly rows="3" placeholder="…"></textarea>
+        <div class="row"><button id="mpCopy">Copy</button><button id="mpShare">Share…</button></div>
+        <div class="lbl" id="mpInLbl">Friend’s code</div><textarea id="mpIn" rows="3" placeholder="Paste here"></textarea>
+        <div class="row"><button id="mpPaste">Paste</button><button id="mpGoM" class="primary">Connect</button></div></div>
+      <div class="row" id="mpGhostRow" hidden><div class="lbl">Show friend as a ghost<small>Super Mario Land: their Mario appears in your level</small></div><label class="sw"><input type="checkbox" id="ghostSw"><span></span></label></div>
+      <div class="row" id="mpWinRow" hidden><div class="lbl">Show friend’s screen window</div><label class="sw"><input type="checkbox" id="winSw"><span></span></label></div>
+      <div class="row col" id="mpManual"><div class="lbl"><small>Can’t connect with a code? Use long manual codes instead (no code service needed):</small></div>
+        <div class="row"><button id="mpHostM">Manual host</button><button id="mpJoinM">Manual join</button></div></div>
     </div>
-    <div class="tip">Both of you need the same ROM file loaded in the app. Super Mario Land itself is single-player, so this runs the game in sync on both devices. Connection is direct between the two devices.</div>
+    <div class="tip">Both of you need the same ROM file in the app. Super Mario Land is single-player, so this runs the game in sync on both devices. The game connection is direct between the two devices; the 6-character code is exchanged through the free ntfy.sh service, which only sees the random code and connection details.</div>
 
     <h3>Game</h3>
     <div class="card">

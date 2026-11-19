@@ -11,4 +11,4 @@ Bring your own ROMs (load them from the in-app menu; they are stored only in you
 
 ## Multiplayer
 
-Menu → Multiplayer: host/join over a direct WebRTC connection by swapping a code (no server). Modes: Race (see your friend's game in a corner window), Co-op split controls, Co-op shared controls. Both players need the same ROM. The emulator is deterministic, so only inputs are exchanged; checksums detect desyncs.
+Menu → Multiplayer: host/join over a direct WebRTC connection using a 6-character code (exchanged via ntfy.sh; manual long codes also available). Modes: Race (see your friend's game in a corner window), Co-op split controls, Co-op shared controls. Both players need the same ROM. The emulator is deterministic, so only inputs are exchanged; checksums detect desyncs.

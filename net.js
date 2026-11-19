@@ -63,7 +63,28 @@ class Peer {
   close() { try { this.dc && this.dc.close(); } catch {} try { this.pc.close(); } catch {} }
 }
 
+/* Short join codes. The two devices meet through a public pub/sub topic named after a random 6-character
+   code (Crockford base32, 30 bits): the host publishes its connection offer there, the guest answers.
+   Only the random code and the (already-public-address) connection descriptions pass through the relay; the
+   game itself is a direct peer-to-peer link. Relay: ntfy.sh (free, no account). */
+const ALPHA = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const RELAY = 'https://ntfy.sh/';
+function newCode() { const a = new Uint8Array(6); crypto.getRandomValues(a); return Array.from(a, v => ALPHA[v & 31]).join(''); }
+function normCode(s) { return String(s).toUpperCase().replace(/O/g, '0').replace(/[IL]/g, '1').replace(/U/g, 'V').replace(/[^0-9A-Z]/g, ''); }
+const topic = code => 'gbmp-' + code.toLowerCase();
+async function publish(code, text) {
+  const r = await fetch(RELAY + topic(code), { method: 'POST', body: text });
+  if (!r.ok) throw new Error('relay ' + r.status);
+}
+// Calls cb(text) for every message on the topic (including ones sent before we joined). Returns a close function.
+function subscribe(code, cb, onError) {
+  const es = new EventSource(RELAY + topic(code) + '/sse?since=all');
+  es.onmessage = e => { try { const m = JSON.parse(e.data); if (m.event === 'message' && typeof m.message === 'string') cb(m.message); } catch {} };
+  es.onerror = () => { if (onError) onError(); };
+  return () => es.close();
+}
+
 const fnv = (arr, step = 1) => { let h = 0x811C9DC5; for (let i = 0; i < arr.length; i += step) { h ^= arr[i]; h = Math.imul(h, 0x01000193); } return h >>> 0; };
 
-root.Net = { Peer, fnv };
+root.Net = { Peer, fnv, newCode, normCode, publish, subscribe };
 })(window);

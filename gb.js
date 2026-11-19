@@ -227,6 +227,7 @@ class GB {
     this.fb = new Uint32Array(160 * 144);
     this.pal = new Uint32Array([0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000]);
     this.bgc = new Uint8Array(160);
+    this.scxLine = new Uint8Array(144);
     this.claimed = new Uint8Array(160);
     this.spr = new Int32Array(10);
     this.serial = '';
@@ -245,7 +246,7 @@ class GB {
     this.hasBattery = [3, 6, 9, 0x0F, 0x10, 0x13, 0x1B, 0x1E].includes(t);
     this.hasRtc = t === 0x0F || t === 0x10;
     this.cgbOnly = data[0x143] === 0xC0;
-    let title = ''; for (let i = 0x134; i < 0x13F; i++) { const c = data[i]; if (c >= 32 && c < 127) title += String.fromCharCode(c); }
+    let title = ''; for (let i = 0x134; i < 0x143; i++) { const c = data[i]; if (c >= 32 && c < 127) title += String.fromCharCode(c); }
     this.title = title.trim();
     const rs = [0, 2048, 8192, 32768, 131072, 65536][data[0x149]] || 0;
     this.ramSize = this.mbc === 2 ? 512 : rs;
@@ -293,8 +294,30 @@ class GB {
 
   /* ---- input ---- bits: 0 right 1 left 2 up 3 down 4 A 5 B 6 select 7 start */
   setPad(m) {
+    // A real D-pad can't press opposite directions at once; many games misbehave if they see it.
+    if ((m & 3) === 3) m &= ~3;
+    if ((m & 12) === 12) m &= ~12;
     const n = m & ~this.pad; this.pad = m;
     if (n && ((!(this.p1sel & 0x10) && (n & 0x0F)) || (!(this.p1sel & 0x20) && (n & 0xF0)))) this.IF |= 0x10;
+  }
+
+  /* Draw OAM entry `i` into `dst` (a 160x144 ABGR buffer) shifted by dx pixels, as a dithered 'ghost'.
+     Uses this emulator's VRAM/palettes for the tile data but the caller's colour table. */
+  drawGhostSprite(i, dst, dx, pal) {
+    const o = i * 4, oam = this.oam, vram = this.vram, h = (this.lcdc & 4) ? 16 : 8;
+    const y0 = oam[o] - 16, x0 = oam[o + 1] - 8 + dx, fl = oam[o + 3];
+    if (oam[o] === 0 || oam[o] >= 160) return;
+    let tile = oam[o + 2]; if (h === 16) tile &= 0xFE;
+    const pv = (fl & 0x10) ? this.obp1 : this.obp0;
+    for (let r = 0; r < h; r++) {
+      const y = y0 + r; if (y < 0 || y >= 144) continue;
+      const row = (fl & 0x40) ? h - 1 - r : r, a = tile * 16 + row * 2, lo = vram[a], hi = vram[a + 1];
+      for (let p = 0; p < 8; p++) {
+        const x = x0 + p; if (x < 0 || x >= 160 || ((x + y) & 1)) continue;
+        const b = (fl & 0x20) ? p : 7 - p, ci = ((lo >> b) & 1) | (((hi >> b) & 1) << 1);
+        if (ci) dst[y * 160 + x] = pal[(pv >> (ci * 2)) & 3];
+      }
+    }
   }
 
   /* ---- memory ---- */
@@ -493,6 +516,7 @@ class GB {
   }
   renderLine() {
     const ly = this.ly, fb = this.fb, base = ly * 160, lcdc = this.lcdc, vram = this.vram, pal = this.pal, bgc = this.bgc;
+    this.scxLine[ly] = this.scx;
     if (lcdc & 1) {
       const bgp = this.bgp, signed = !(lcdc & 16);
       const y = (ly + this.scy) & 255, mrow = ((lcdc & 8) ? 0x1C00 : 0x1800) + ((y >> 3) << 5), ty = y & 7;
