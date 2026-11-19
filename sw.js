@@ -1,6 +1,6 @@
 // Network-first service worker: always picks up new versions when online, works offline from cache otherwise.
-const V = 'gb-v12';
-const ASSETS = ['./', 'index.html', 'gb.js?v=11', 'net.js?v=11', 'app.js?v=11', 'manifest.webmanifest', 'icon.png'];
+const V = 'gb-v13';
+const ASSETS = ['./', 'index.html', 'gb.js?v=12', 'net.js?v=12', 'app.js?v=12', 'manifest.webmanifest', 'icon.png'];
 self.addEventListener('install', e => e.waitUntil(caches.open(V).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(
   caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim())));

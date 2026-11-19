@@ -1,9 +1,9 @@
 'use strict';
 (() => {
 const $ = id => document.getElementById(id);
-const canvas = $('lcd'), ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const canvas = $('lcd'), ctx = canvas.getContext('2d', { alpha: false });
 const root = document.documentElement;
-const APP_VERSION = '11';   // bump together with index.html (?v=) and sw.js; both players must match
+const APP_VERSION = '12';   // bump together with index.html (?v=) and sw.js; both players must match
 const IS_IPAD = /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 /* ---------------------------------------------------------- settings */
@@ -56,14 +56,15 @@ const shown32 = new Uint32Array(shown.data.buffer);
 let fb32 = null, glassDirty = true;
 function resetGlass() { shown32.fill(PAL32[0]); ctx.putImageData(shown, 0, 0); }
 resetGlass();
+let blendK = 0.62;
 function present() {
-  const a = fb32, s = shown32, o = shown.data;
+  const a = fb32, s = shown32, o = shown.data, K = blendK;
   let dirty = glassDirty;
   if (lcdFx && !ff) {
     for (let i = 0; i < 23040; i++) {
       const t = a[i]; if (t === s[i]) continue;
       dirty = true; const j = i << 2;
-      o[j] += ((t & 255) - o[j]) * 0.62; o[j + 1] += (((t >> 8) & 255) - o[j + 1]) * 0.62; o[j + 2] += (((t >> 16) & 255) - o[j + 2]) * 0.62;
+      o[j] += ((t & 255) - o[j]) * K; o[j + 1] += (((t >> 8) & 255) - o[j + 1]) * K; o[j + 2] += (((t >> 16) & 255) - o[j + 2]) * K;
     }
   } else {
     for (let i = 0; i < 23040; i++) if (a[i] !== s[i]) { s[i] = a[i]; dirty = true; }
@@ -148,9 +149,12 @@ function unlockAudio() {
   } catch (e) { console.warn('audio', e); }
   updateSnd();
 }
+let sndKey = '';
 function updateSnd() {
   const ok = audio && audio.ctx.state === 'running';
   const sleeping = audio && paused && audio.ctx.state === 'suspended';
+  const key = `${!!audio}|${ok}|${sleeping}|${volume === 0}|${audio ? audio.ctx.state : ''}`;
+  if (key === sndKey) return; sndKey = key;
   $('sndBtn').classList.toggle('warn', !ok && !sleeping);
   $('sndWaves').style.display = ok && volume > 0 ? '' : 'none';
   $('sndStatus').textContent = !audio ? 'Not started. Tap anywhere or press Test beep.' : ok ? `Playing at ${audio.ctx.sampleRate} Hz` + (volume === 0 ? ' (volume is 0)' : '') : sleeping ? 'Sleeping while paused (saves battery)' : `Blocked (${audio.ctx.state}). Tap Test beep.`;
@@ -350,23 +354,30 @@ const maskText = m => MASK_NAMES.filter((_, i) => m & (1 << i)).join(' ') || '鈥
    snapped to a standard rate, so jitter never causes a skipped or doubled frame. Games run at 60 fps
    (hardware: 59.73); audio absorbs the 0.45% difference. When paused the loop stops entirely (no wake-ups). */
 const TARGET_FPS = 60, SNAP = [24, 25, 30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 240];
-let raf = 0, last = 0, acc = 0, dispHz = 60, winT0 = 0, winN = 0, winBad = false;
+let raf = 0, last = 0, acc = 0, dispHz = 60, smoothTicks = false;
 let frames = 0, fpsT = 0, produced = 0, fillAvg = AUDIO_TARGET, lastMask = 0;
-function kick() { if (!raf) { last = 0; winN = 0; raf = requestAnimationFrame(frame); } }
+const PERF = { work: new Float32Array(600), dt: new Float32Array(600), i: 0, workMax: 0, late: 0, ticks: 0, multi: 0, skipped: 0 };
+function kick() { if (!raf) { last = 0; dtWin.length = 0; raf = requestAnimationFrame(frame); } }
 
+function applyRate() {
+  const uneven = Math.abs(dispHz - TARGET_FPS) >= 3 && Math.abs(Math.round(dispHz / TARGET_FPS) - dispHz / TARGET_FPS) > 0.02 && dispHz > TARGET_FPS;
+  smoothTicks = uneven && lcdFx;
+  blendK = smoothTicks ? 1 - Math.pow(0.38, TARGET_FPS / dispHz) : 0.62;   // same total response time as at 60 Hz
+}
+const dtWin = [];
+let pendingHz = 0;
 function measureRefresh(ts, dt) {
-  if (dt > 100) winBad = true;
-  if (!winN) { winT0 = ts; winBad = false; }
-  if (++winN > 90) {
-    if (!winBad) {
-      const hz = (winN - 1) * 1000 / (ts - winT0);
-      if (hz > 20 && hz < 300) {
-        const s = SNAP.reduce((a, b) => Math.abs(b - hz) < Math.abs(a - hz) ? b : a);
-        dispHz = Math.abs(s - hz) / s < 0.02 ? s : hz;
-      }
-    }
-    winN = 0;
-  }
+  if (dt > 0 && dt < 100) dtWin.push(dt);                 // ignore huge gaps (tab switch, stall of a whole window)
+  if (dtWin.length < 90) return;
+  dtWin.sort((x, y) => x - y);
+  const med = dtWin[dtWin.length >> 1]; dtWin.length = 0;  // median: a few stalls can't move it
+  const hz = 1000 / med;
+  if (!(hz > 20 && hz < 300)) return;
+  const s = SNAP.reduce((x, y) => Math.abs(y - hz) < Math.abs(x - hz) ? y : x);
+  const cand = Math.abs(s - hz) / s < 0.05 ? s : Math.round(hz * 10) / 10;
+  if (cand === dispHz) { pendingHz = 0; return; }
+  if (pendingHz === cand) { dispHz = cand; pendingHz = 0; acc = 0; applyRate(); }   // changed twice in a row: believe it
+  else pendingHz = cand;
 }
 function tuneAudio() {
   const a = gb.apu;
@@ -380,6 +391,7 @@ function frame(ts) {
   if (paused || document.hidden) return;        // stop completely; kick() restarts it
   raf = requestAnimationFrame(frame);
   const dt = last ? ts - last : 1000 / 60; last = ts;
+  const w0 = performance.now();
   measureRefresh(ts, dt);
   frames++; fpsT += dt;
   const gp = gamepadMask();
@@ -390,7 +402,9 @@ function frame(ts) {
     gb.setPad(mask); showPressed(mask);
     let n = 0;
     if (ff && !mp.active) n = 4;
+    else if (Math.abs(dispHz - TARGET_FPS) < 3) n = 1;                      // ~60 Hz screen: exactly one frame per refresh, always
     else { acc += TARGET_FPS / dispHz; while (acc >= 0.999 && n < 4) { acc -= 1; n++; } if (acc > 4) acc = 0; }
+    if (n > 1 && !ff && Math.abs(dispHz - TARGET_FPS) < 3) PERF.multi++;
     if (mp.active) {
       let adv = 0;
       for (let i = 0; i < n; i++) { if (mpStep(mask)) adv++; else { acc = 0; break; } }
@@ -400,12 +414,15 @@ function frame(ts) {
       }
     } else {
       for (let i = 0; i < n; i++) { if (!ff) tuneAudio(); gb.runFrame(); }
-      if (n) { present(); produced += n; }
+      if (n) { present(); produced += n; } else if (smoothTicks) present();
     }
     if (gb.ramDirty && ts - lastSave > 2000) { lastSave = ts; flushSave(); }
   }
+  const work = performance.now() - w0, k = PERF.i++ % 600; PERF.work[k] = work; PERF.dt[k] = dt; PERF.ticks++;
+  if (work > PERF.workMax) PERF.workMax = work; if (dt > 1.5 * 1000 / dispHz) PERF.late++;
   if (fpsT >= 1000) {
     if (showFps) $('fps').textContent = `${(produced * 1000 / fpsT).toFixed(1)} fps 路 display ${(frames * 1000 / fpsT).toFixed(1)} Hz 路 in: ${maskText(lastMask)}` +
+      ` 路 work ${(PERF.work.reduce((s, x) => s + x, 0) / Math.min(600, PERF.ticks)).toFixed(1)}/${PERF.workMax.toFixed(1)} ms 路 late ${PERF.late}` +
       (audio ? ` 路 audio ${audio.ctx.state}${gb ? ' buf ' + gb.apu.fill() : ''}` : ' 路 audio off');
     fpsT = 0; frames = 0; produced = 0; updateSnd();
   }
@@ -808,7 +825,8 @@ function mpGhost() {
     if (!g.vis || g.lv !== mylv || now - g.last > GHOST_STALE || !g.spr.length) continue;
     const a = clamp((now - g.t0) / GHOST_MS, 0, 1), wx = g.cx + (g.tx - g.cx) * a, wy = g.cy + (g.ty - g.cy) * a;
     const sx = Math.round(wx - cam.me.abs), sy = Math.round(wy), pat = pid % 5;
-    for (const [dx, dy, tile, fl] of g.spr) {
+    for (let si = 0; si < g.spr.length; si++) {
+      const sp = g.spr[si], dx = sp[0], dy = sp[1], tile = sp[2], fl = sp[3];
       const t = g.tiles[tile]; if (!t) continue;
       const px = sx + dx - 8, py = sy + dy - 16, pv = (fl & 0x10) ? gb.obp1 : gb.obp0;
       for (let r = 0; r < 8; r++) {
@@ -944,7 +962,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 
 $('ver').textContent = 'Version ' + APP_VERSION;
 mpUi(); layout();
-window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask, ghosts: mp.ghosts });
+window.__gb = () => ({ gb, audio, dispHz, mode, kdev, mp, cam, touchMask, ghosts: mp.ghosts, PERF });
 
 // Resume the last game (after a tap, so audio and fullscreen are allowed to start), otherwise show the menu.
 (async () => {
