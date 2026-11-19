@@ -1,0 +1,4 @@
+*.gb
+*.gbc
+*.sav
+node_modules/

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GB</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GB">
+<meta name="theme-color" content="#0d0e11">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="icon" href="icon.png">
+<style>
+  :root {
+    --u: 200px;       /* control size, set by JS */
+    --padw: 240px;    /* width of the side control columns (landscape) */
+    --ctrlh: 340px;   /* height of the control strip (portrait) */
+    --lift: 50px;     /* how far the controls sit above the bottom edge */
+    --bg: #0d0e11; --panel: #1b1d24; --ink: #ececf1; --dim: #8b8e9b; --accent: #9bba3e; --btn: #2b2e39; --btn-on: #4a4f63;
+    --glass: rgba(255,255,255,.075); --glass-edge: rgba(255,255,255,.16); --glass-on: rgba(155,186,62,.55);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden; overscroll-behavior: none;
+    font: 15px/1.4 -apple-system, system-ui, sans-serif; }
+  body { position: fixed; inset: 0; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: none; }
+
+  #app { position: absolute; inset: 0; display: grid;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #app[data-land="1"] { grid-template-columns: var(--padw) 1fr var(--padw); grid-template-rows: minmax(0, 1fr); grid-template-areas: "left stage right"; }
+  #app[data-land="0"] { grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) var(--ctrlh); grid-template-areas: "stage stage" "left right"; }
+
+  #stage { grid-area: stage; display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 0; position: relative; }
+  #lcd { display: block; background: #9bb04e; image-rendering: pixelated; image-rendering: crisp-edges; border-radius: 2px; box-shadow: 0 0 0 1px rgba(255,255,255,.06), 0 10px 40px rgba(0,0,0,.6); }
+  #hint { position: absolute; pointer-events: none; color: #1d2a10; font: 700 clamp(12px, 2.2vw, 22px) ui-monospace, Menlo, monospace; text-align: center; }
+  #fps { position: absolute; left: calc(env(safe-area-inset-left) + 10px); top: calc(env(safe-area-inset-top) + 8px); font: 12px ui-monospace, monospace; color: var(--accent); display: none; z-index: 4; }
+
+  /* ---- touch controls: translucent, big, low on the screen where thumbs rest ---- */
+  .pad { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; touch-action: none;
+    padding-bottom: calc(var(--lift) + 8px); min-width: 0; min-height: 0; }
+  #left { grid-area: left; } #right { grid-area: right; }
+  #app[data-land="0"] .pad { justify-content: flex-start; padding-top: 8px; padding-bottom: calc(var(--lift) * .5); }
+
+  #dpad { position: relative; width: var(--u); height: var(--u); flex: none; }
+  #dpad .base { position: absolute; inset: 0; border-radius: 50%; background: var(--glass); border: 1.5px solid var(--glass-edge); }
+  #dpad .h, #dpad .v { position: absolute; background: rgba(255,255,255,.1); border-radius: calc(var(--u) * .09); }
+  #dpad .h { left: 9%; right: 9%; top: 35%; height: 30%; }
+  #dpad .v { top: 9%; bottom: 9%; left: 35%; width: 30%; }
+  #dpad [data-d] { position: absolute; width: 30%; height: 30%; display: flex; align-items: center; justify-content: center; border-radius: calc(var(--u) * .09);
+    color: rgba(255,255,255,.45); font-size: calc(var(--u) * .1); transition: background .04s; }
+  #dpad [data-d].on { background: var(--glass-on); color: #fff; }
+  #dpad .u { left: 35%; top: 9%; } #dpad .d { left: 35%; bottom: 9%; } #dpad .l { left: 9%; top: 35%; } #dpad .r { right: 9%; top: 35%; }
+
+  #ab { position: relative; width: var(--u); height: calc(var(--u) * .92); flex: none; }
+  .rb { position: absolute; width: calc(var(--u) * .5); height: calc(var(--u) * .5); border-radius: 50%; background: var(--glass); border: 2px solid var(--glass-edge);
+    display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: calc(var(--u) * .17); color: rgba(255,255,255,.55);
+    transition: background .04s, transform .04s; }
+  .rb.on { background: var(--glass-on); color: #fff; transform: scale(.94); }
+  #btnB { left: 0; bottom: 0; } #btnA { right: 0; top: 0; }
+  #btnA { border-color: rgba(229,82,127,.55); } #btnB { border-color: rgba(229,166,82,.55); }
+
+  .sm { margin-top: calc(var(--u) * .14); width: calc(var(--u) * .66); height: calc(var(--u) * .22); border-radius: 99px; background: var(--glass); border: 1.5px solid var(--glass-edge);
+    display: flex; align-items: center; justify-content: center; font-size: calc(var(--u) * .075); font-weight: 700; letter-spacing: .1em; color: rgba(255,255,255,.5); }
+  .sm.on { background: var(--glass-on); color: #fff; }
+
+  #menuBtn { position: absolute; z-index: 5; top: calc(env(safe-area-inset-top) + 10px); right: calc(env(safe-area-inset-right) + 10px);
+    width: 52px; height: 52px; border: 0; border-radius: 14px; background: rgba(60,63,75,.75); color: var(--ink); font-size: 22px; }
+
+  /* ---- menu ---- */
+  #menu { position: absolute; inset: 0; z-index: 10; background: rgba(0,0,0,.65); display: none; align-items: center; justify-content: center;
+    padding: calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 12px); touch-action: auto; }
+  #menu.open { display: flex; }
+  #sheet { background: var(--panel); border-radius: 18px; width: min(560px, 100%); max-height: 100%; overflow: auto; padding: 20px; user-select: none; touch-action: pan-y; }
+  #sheet h2 { margin: 0 0 12px; font-size: 18px; display: flex; justify-content: space-between; align-items: center; }
+  #sheet h3 { margin: 20px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+  button, .btn { font: inherit; color: var(--ink); background: var(--btn); border: 0; border-radius: 12px; padding: 13px 16px; }
+  button:active, .btn:active { background: var(--btn-on); }
+  .primary { background: var(--accent); color: #111; font-weight: 600; }
+  .row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+  .row > label { flex: 1; }
+  .row > input[type=range] { flex: 2; height: 32px; }
+  #library .item { display: flex; gap: 8px; margin: 8px 0; }
+  #library .item .play { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #library .item .del { width: 52px; color: #e88; }
+  .empty { color: var(--dim); font-size: 14px; }
+  #file { display: none; }
+  #toast { position: absolute; z-index: 20; left: 50%; bottom: 20px; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 10px; display: none; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="app" data-land="1">
+  <div id="stage">
+    <canvas id="lcd" width="160" height="144"></canvas>
+    <div id="hint"></div>
+  </div>
+  <div id="left" class="pad">
+    <div id="dpad">
+      <div class="base"></div><i class="h"></i><i class="v"></i>
+      <div class="u" data-d="2">▲</div><div class="d" data-d="3">▼</div><div class="l" data-d="1">◀</div><div class="r" data-d="0">▶</div>
+    </div>
+    <div class="sm" id="select" data-b="6">SELECT</div>
+  </div>
+  <div id="right" class="pad">
+    <div id="ab">
+      <div class="rb" id="btnB" data-b="5">B</div>
+      <div class="rb" id="btnA" data-b="4">A</div>
+    </div>
+    <div class="sm" id="start" data-b="7">START</div>
+  </div>
+  <div id="fps"></div>
+  <button id="menuBtn" aria-label="Menu">☰</button>
+</div>
+
+<div id="menu">
+  <div id="sheet">
+    <h2>Game Boy <button id="closeMenu">Done</button></h2>
+    <div class="row">
+      <label class="btn primary" for="file" style="text-align:center">Load ROM file…</label>
+      <input id="file" type="file" multiple>
+    </div>
+    <h3>Library</h3>
+    <div id="library"></div>
+    <h3>Comfort</h3>
+    <div class="row"><label for="csize">Control size</label><input id="csize" type="range" min="0.7" max="1.4" step="0.05"></div>
+    <div class="row"><label for="clift">Control height</label><input id="clift" type="range" min="0" max="1" step="0.05"></div>
+    <h3>Settings</h3>
+    <div class="row"><label for="vol">Volume</label><input id="vol" type="range" min="0" max="1" step="0.05"></div>
+    <div class="row"><label for="ffBtn">Fast-forward</label><button id="ffBtn">Off</button></div>
+    <div class="row"><label for="fpsBtn">Show FPS</label><button id="fpsBtn">Off</button></div>
+    <div class="row"><label>Current game</label><button id="resetBtn">Reset</button></div>
+    <h3>Tips</h3>
+    <div class="empty">Landscape is the most comfortable: thumbs rest on the bottom corners. Touches anywhere in the left column steer the D-pad, so you don’t have to hit it exactly. Keyboard: arrows, X = A, Z = B, Enter = Start, Shift = Select. Gamepads work too.</div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script src="gb.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
